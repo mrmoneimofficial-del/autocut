@@ -1,0 +1,28 @@
+{
+  "name": "autocut",
+  "version": "1.0.0",
+  "private": true,
+  "description": "قصّاص — قص الصمت من الفيديو بأقصى سرعة",
+  "scripts": {
+    "dev": "next dev -p 3000 2>&1 | tee dev.log",
+    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "lucide-react": "^0.525.0",
+    "next": "^16.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "bun-types": "^1.3.4",
+    "eslint": "^9",
+    "eslint-config-next": "^16.1.1",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

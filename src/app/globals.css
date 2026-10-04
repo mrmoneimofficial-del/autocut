@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-cairo), "Segoe UI", system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: light only;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-feature-settings: "kern";
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: #fdba74;
+  color: #431407;
+}
+
+/* thin subtle scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #e4e4e7 transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #e4e4e7;
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #d4d4d8;
+}
+
+/* pulsing orange dot for active processing states */
+@keyframes soft-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.86); }
+}
+.pulse-dot {
+  animation: soft-pulse 1.4s ease-in-out infinite;
+}
