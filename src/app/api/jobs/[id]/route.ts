@@ -18,10 +18,19 @@ function readJSON<T = Record<string, unknown>>(file: string): T | null {
 function jobDirOf(id: string) { return path.join(ROOT, id) }
 
 function statusOf(id: string) {
-  const job = readJSON(path.join(ROOT, id, 'job.json'))
+  const job = readJSON<Record<string, any>>(path.join(ROOT, id, 'job.json'))
   if (!job) return null
   const prog = readJSON(path.join(ROOT, id, 'progress.json'))
-  return { ...job, progress: prog && ACTIVE.has(String(prog.phase)) ? prog : null }
+  const st: Record<string, any> = { ...job, progress: prog && ACTIVE.has(String(prog.phase)) ? prog : null }
+  // live upload coverage — lets the client resume EXACTLY where it stopped
+  if (st.phase === 'uploading') {
+    const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(ROOT, id, 'chunks.json'))
+    if (cov && Array.isArray(cov.intervals)) {
+      st.uploaded = cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0)
+      st.uploadIntervals = cov.intervals
+    }
+  }
+  return st
 }
 
 /** GET /api/jobs/:id — full status (polled by the UI). */
@@ -46,6 +55,14 @@ export async function POST(req: Request, ctx: Ctx) {
   const action = body?.action
 
   if (action === 'analyze') {
+    // only from a fully-arrived file (coverage complete or phase already flipped)
+    if (job.phase === 'uploading') {
+      const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(dir, 'chunks.json'))
+      const covered = cov && Array.isArray(cov.intervals)
+        ? cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0) : 0
+      if (covered < job.size) return Response.json({ error: 'الرفع لسه مش خلص' }, { status: 409 })
+      job.phase = 'uploaded'
+    }
     if (job.phase !== 'uploaded' && job.phase !== 'error') {
       return Response.json({ error: 'الحالة الحالية مش صالحة للتحليل' }, { status: 409 })
     }

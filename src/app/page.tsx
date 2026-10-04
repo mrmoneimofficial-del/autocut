@@ -14,6 +14,7 @@ type Job = {
   size: number
   phase: 'uploading' | 'uploaded' | 'analyzing' | 'ready' | 'rendering' | 'done' | 'error'
   uploaded: number
+  uploadIntervals?: [number, number][]
   error?: string
   meta?: { durationMs: number; fps: number; width: number; height: number; sr: number; ch: number }
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
@@ -34,11 +35,14 @@ const fmtETA = (sec: number) => {
 }
 
 /* -------------------------------------------------------------- uploading */
-function putChunk(jobId: string, offset: number, blob: Blob, onLoaded: (n: number) => void) {
+const LANES = 4 // parallel upload lanes — saturates the pipe instead of waiting per-chunk
+
+function putChunk(jobId: string, offset: number, blob: Blob, sha: string, onLoaded: (n: number) => void) {
   return new Promise<{ ok: boolean; status: number; data: any }>((resolve) => {
     const xhr = new XMLHttpRequest()
     xhr.open('PUT', `/api/jobs/${jobId}/file?offset=${offset}`)
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    if (sha) xhr.setRequestHeader('X-Chunk-SHA256', sha)
     xhr.upload.onprogress = (e) => onLoaded(e.loaded)
     xhr.onload = () => {
       let data: any = null
@@ -52,18 +56,90 @@ function putChunk(jobId: string, offset: number, blob: Blob, onLoaded: (n: numbe
   })
 }
 
-async function uploadFile(jobId: string, file: File, onProgress: (sent: number) => void) {
-  const CHUNK = 8 * 1024 * 1024
-  let offset = 0
-  let failures = 0
-  while (offset < file.size) {
-    const end = Math.min(offset + CHUNK, file.size)
-    const res = await putChunk(jobId, offset, file.slice(offset, end), (loaded) => onProgress(offset + loaded))
-    if (res.status === 409 && res.data?.uploaded != null) { offset = res.data.uploaded; failures = 0; continue }
-    if (res.ok && res.data?.uploaded != null) { offset = res.data.uploaded; failures = 0; continue }
-    if (++failures > 5) throw new Error(res.data?.error || 'فشل الرفع — الشبكة ضعيفة')
-    await new Promise((r) => setTimeout(r, 1200 * failures))
+async function sha256Hex(blob: Blob): Promise<string> {
+  try {
+    const buf = await blob.arrayBuffer()
+    const h = await crypto.subtle.digest('SHA-256', buf)
+    let s = ''
+    const u = new Uint8Array(h)
+    for (let i = 0; i < u.length; i++) s += u[i].toString(16).padStart(2, '0')
+    return s
+  } catch { return '' } // very old browsers → skip integrity header
+}
+
+/** is chunk [s,e) fully inside the merged server intervals? */
+function chunkDone(intervals: [number, number][], s: number, e: number) {
+  for (const [a, b] of intervals) {
+    if (a >= e) break
+    if (a <= s && e <= b) return true
   }
+  return false
+}
+
+/**
+ * Resumable parallel uploader.
+ * - 4 lanes pull chunk indexes from a shared queue (out-of-order server writes)
+ * - every chunk carries SHA-256; server verifies before writing
+ * - unlimited retries with capped backoff — network drops / server restarts
+ *   NEVER restart the upload from zero: server coverage map tells us what's
+ *   already on disk and we only send the missing ranges
+ */
+async function uploadFile(
+  jobId: string,
+  file: File,
+  onProgress: (sent: number) => void,
+  onNotice: (msg: string) => void,
+  resumeIntervals?: [number, number][],
+) {
+  const CHUNK = 8 * 1024 * 1024
+  const size = file.size
+  const nChunks = Math.max(1, Math.ceil(size / CHUNK))
+
+  const covered: boolean[] = new Array(nChunks).fill(false)
+  let doneBytes = 0
+  if (resumeIntervals?.length) {
+    for (let i = 0; i < nChunks; i++) {
+      const s = i * CHUNK, e = Math.min(s + CHUNK, size)
+      if (chunkDone(resumeIntervals, s, e)) { covered[i] = true; doneBytes += e - s }
+    }
+    if (doneBytes > 0) onNotice(`كمّلنا من حيث وقفنا — ${fmtMB(doneBytes)} كانوا اترفعوا خلاص`)
+  }
+  onProgress(doneBytes)
+
+  const queue: number[] = []
+  for (let i = 0; i < nChunks; i++) if (!covered[i]) queue.push(i)
+  if (queue.length === 0) return
+
+  const inflight: number[] = new Array(LANES).fill(0)
+  const report = () => onProgress(doneBytes + inflight.reduce((a, b) => a + b, 0))
+
+  const lane = async (li: number) => {
+    while (true) {
+      const idx = queue.shift()
+      if (idx === undefined) return
+      const start = idx * CHUNK, end = Math.min(start + CHUNK, size)
+      const blob = file.slice(start, end)
+      const sha = await sha256Hex(blob)
+      inflight[li] = 0
+      for (let attempt = 0; ; attempt++) {
+        const res = await putChunk(jobId, start, blob, sha, (loaded) => { inflight[li] = loaded; report() })
+        if (res.ok) break
+        if (res.status === 409) {
+          // server closed the upload phase (already complete) → lane done
+          if (res.data?.complete) return
+          throw new Error(res.data?.error || 'الرفع اتقفل من السيرفر')
+        }
+        if (res.status === 422 && attempt >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
+        if (attempt === 0) onNotice('مشكلة شبكة — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
+        else if (attempt % 5 === 4) onNotice(`لسه بنحاول — محاولة ${attempt + 1} (عند ${fmtMB(start)})`)
+        await new Promise((r) => setTimeout(r, Math.min(8000, 700 * 2 ** Math.min(attempt, 4))))
+      }
+      inflight[li] = 0
+      doneBytes += end - start
+      report()
+    }
+  }
+  await Promise.all(Array.from({ length: LANES }, (_, i) => lane(i)))
 }
 
 /* --------------------------------------------------------------- timeline */
@@ -136,6 +212,7 @@ export default function Home() {
   const [job, setJob] = useState<Job | null>(null)
   const [jobErr, setJobErr] = useState<string | null>(null)
   const [up, setUp] = useState<{ file: File; sent: number; speed: number } | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [view, setView] = useState<'src' | 'out'>('src')
   const [skip, setSkip] = useState(true)
   const [gapMs, setGapMs] = useState(200)
@@ -181,27 +258,57 @@ export default function Home() {
   /* upload flow */
   const startUpload = useCallback(async (file: File) => {
     setJobErr(null)
+    setNotice(null)
     setUp({ file, sent: 0, speed: 0 })
     speedTracker.current = { last: 0, at: Date.now() }
     try {
-      const r = await fetch('/api/jobs', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: file.name, size: file.size }),
-      })
-      if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
-      const { id } = await r.json()
-      localStorage.setItem('qattaas:job', id)
-      await uploadFile(id, file, (sent) => {
-        const tr = speedTracker.current
-        const now = Date.now()
-        if (now - tr.at > 700 && sent > tr.last) {
-          const speed = ((sent - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
-          setUp((u) => (u ? { ...u, sent, speed } : u))
-          speedTracker.current = { last: sent, at: now }
-        } else {
-          setUp((u) => (u ? { ...u, sent } : u))
-        }
-      })
+      // resume an interrupted upload of the SAME file if one exists on the server
+      let id = ''
+      let resumeIntervals: [number, number][] | undefined
+      const savedId = localStorage.getItem('qattaas:job')
+      if (savedId) {
+        try {
+          const r = await fetch(`/api/jobs/${savedId}`, { cache: 'no-store' })
+          if (r.ok) {
+            const j = await r.json()
+            if (j?.phase === 'uploading' && j.name === file.name && Number(j.size) === file.size) {
+              id = String(j.id)
+              resumeIntervals = (j.uploadIntervals || []).map(
+                (iv: any) => [Number(iv[0]), Number(iv[1])] as [number, number],
+              )
+            }
+          }
+        } catch { /* offline — fall through to fresh job */ }
+      }
+
+      if (!id) {
+        const r = await fetch('/api/jobs', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: file.name, size: file.size }),
+        })
+        if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
+        const { id: newId } = await r.json()
+        id = String(newId)
+        localStorage.setItem('qattaas:job', id)
+      }
+
+      await uploadFile(
+        id,
+        file,
+        (sent) => {
+          const tr = speedTracker.current
+          const now = Date.now()
+          if (now - tr.at > 700 && sent > tr.last) {
+            const speed = ((sent - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
+            setUp((u) => (u ? { ...u, sent, speed } : u))
+            speedTracker.current = { last: sent, at: now }
+          } else {
+            setUp((u) => (u ? { ...u, sent } : u))
+          }
+        },
+        (msg) => setNotice(msg),
+        resumeIntervals,
+      )
       const ar = await fetch(`/api/jobs/${id}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'analyze' }),
@@ -227,7 +334,7 @@ export default function Home() {
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
-    setJob(null); setUp(null); setJobErr(null); setView('src'); setSkip(true)
+    setJob(null); setUp(null); setJobErr(null); setNotice(null); setView('src'); setSkip(true)
   }
 
   /* smart skip + playhead */
@@ -324,6 +431,42 @@ export default function Home() {
     )
   }
 
+  /* ------------------------------------- render: interrupted upload (resume) */
+  if (job && !up && job.phase === 'uploading') {
+    const pct = job.size ? Math.min(100, ((job.uploaded || 0) / job.size) * 100) : 0
+    return (
+      <div className="h-dvh flex flex-col bg-white">
+        <Header hasJob onNew={newVideo} />
+        <main className="flex-1 grid place-items-center p-6">
+          <div className="w-full max-w-lg -mt-10 rounded-3xl border border-orange-200 bg-orange-50/50 p-8 shadow-sm">
+            <div className="flex items-center gap-4 mb-5">
+              <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
+                <RefreshCw className="w-6 h-6 text-orange-500" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-bold truncate">{job.name}</div>
+                <div className="text-sm text-zinc-500">{fmtMB(job.uploaded || 0)} من {fmtMB(job.size)} اترفعوا خلاص</div>
+              </div>
+            </div>
+            <div className="h-3 rounded-full bg-orange-100 overflow-hidden mb-5">
+              <div className="h-full rounded-full bg-orange-500" style={{ width: `${pct}%` }} />
+            </div>
+            <p className="text-sm text-zinc-600 leading-relaxed mb-4">
+              الرفع اتقطع (قفلت الصفحة أو النت وقع) — <b>اختار نفس الملف تاني</b> وهنكمّل من نفس النقطة بالظبط، من غير ما نبدأ من الأول.
+            </p>
+            <label className="group flex flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-orange-300 bg-white px-6 py-8 cursor-pointer transition hover:border-orange-400 hover:bg-orange-50/40">
+              <input type="file" accept="video/*" className="sr-only"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) startUpload(f) }} />
+              <Upload className="w-6 h-6 text-orange-500" />
+              <span className="font-bold">اختار نفس الملف — «{job.name}»</span>
+              <span className="text-xs text-zinc-500">لازم نفس الملف بالظبط (الاسم والحجم) عشان نتأكد إنه هو هو</span>
+            </label>
+          </div>
+        </main>
+      </div>
+    )
+  }
+
   /* ---------------------------------------------------------- render: upload progress */
   if (!job && up) {
     const pct = up.file.size ? Math.min(100, (up.sent / up.file.size) * 100) : 0
@@ -345,6 +488,12 @@ export default function Home() {
             <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
               <div className="h-full rounded-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
             </div>
+            {notice && (
+              <div className="mt-3 flex items-center gap-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 text-xs font-bold text-orange-700">
+                <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin" style={{ animationDuration: '3s' }} />
+                {notice}
+              </div>
+            )}
             <div className="mt-3 flex justify-between text-sm text-zinc-500">
               <span className="font-bold text-zinc-900">{pct.toFixed(0)}%</span>
               <span>{up.speed > 0.05 ? `${up.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>

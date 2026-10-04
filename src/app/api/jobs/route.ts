@@ -19,8 +19,17 @@ export async function POST(req: Request) {
     }
     const ext = EXT_OK.has(path.extname(name).toLowerCase()) ? path.extname(name).toLowerCase() : '.mp4'
 
+    // storage must be writable — serverless deploys (Vercel…) have a read-only FS
+    try {
+      fs.mkdirSync(ROOT, { recursive: true })
+      fs.writeFileSync(path.join(ROOT, '.probe'), String(Date.now()))
+    } catch {
+      return Response.json({
+        error: 'السيرفر ده للعرض بس — التخزين مش متاح هنا. شغّل التطبيق محليًا عشان الرفع والقص',
+      }, { status: 503 })
+    }
+
     // sweep jobs older than 24h (renders never take that long)
-    fs.mkdirSync(ROOT, { recursive: true })
     const now = Date.now()
     for (const id of fs.readdirSync(ROOT)) {
       const dir = path.join(ROOT, id)
