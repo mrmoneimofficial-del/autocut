@@ -1,22 +1,14 @@
 # قصّاص — production image (UI + API + ffmpeg engine in one container)
 #
-# Works on: Hugging Face Spaces (free), Railway, Render, Fly.io, any VPS, docker run
+# Works on: Railway, Render, Fly.io, any VPS, docker run — or Hugging Face Spaces (PRO $9/mo since 2025)
 #
 #   docker build -t autocut .
 #   docker run -p 3000:3000 -e PORT=3000 -v autocut-data:/app/storage autocut
 #
-# Hugging Face Spaces notes:
-#   * Spaces run containers as UID 1000 → we run as the built-in `node` user (UID 1000)
-#   * Spaces expect the app on port 7860 (default here; Railway/VPS inject PORT env)
-#   * Put this in the Space's README.md YAML:
-#       ---
-#       title: Qattaas
-#       emoji: ✂️
-#       colorFrom: orange
-#       colorTo: yellow
-#       sdk: docker
-#       app_port: 7860
-#       ---
+# Free hosting notes (Oct 2026):
+#   * Hugging Face Spaces now requires a PRO subscription ($9/mo) for Docker SDK
+#   * Free alternatives shipped in this repo: colab.ipynb (one-click Colab) and
+#     modal_app.py (Modal — $30/month free credits, deploys THIS Dockerfile)
 
 # ---------- build stage ----------
 FROM node:22-slim AS build

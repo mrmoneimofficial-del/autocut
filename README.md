@@ -47,33 +47,36 @@ bun run dev     # http://localhost:3000
 
 > **ملاحظة:** المعالجة تعتمد على `ffmpeg` على السيرفر — المنصة السحابية بدون ffmpeg ستعرض الواجهة فقط دون قدرة على المعالجة. للنشر الكامل على لينك عام، استخدم `Dockerfile` المرفق (شوف قسم Docker بالأسفل).
 
-## ☁️ النشر المجاني الكامل — Hugging Face Spaces (الخيار الأفضل)
+## ☁️ النشر المجاني غير المحلي — الخيارات الحقيقية (أكتوبر 2026)
 
-**Hugging Face Spaces** بتديك مجانًا حاوية Docker حقيقية: **2 معالج vCPU + 16GB رام** — أقوى من سيرفرات كتير مدفوعة، ومناسبة تمامًا لمحرك القص (نفس سرعة جهازنا: فيديو 110 دقيقة ≈ 9 دقائق).
+> ⚠️ **مهم:** Hugging Face غيّرت سياستها منتصف 2025 — حاويات **Docker/Gradio Spaces بقت تتطلب اشتراك PRO ($9/شهر)** حتى على أضعف عتاد. الحساب المجاني بيسمح بـ Static Spaces فقط (بدون سيرفر = بدون ffmpeg) — اتأكدنا من ده بالتجربة الفعلية.
 
-**الخطوات (5 دقايق):**
-1. اعمل حساب مجاني على [huggingface.co](https://huggingface.co)
-2. من صفحتك → **New Space** → سمّيه `qattaas` → **Docker** → **CPU Basic (Free)**
-3. ارفع ملفات الريبو ده للـ Space (Dockerfile + باقي الملفات) — أوامر git مباشرة:
-   ```bash
-   git clone https://huggingface.co/spaces/USERNAME/qattaas && cd qattaas
-   # انسخ ملفات المشروع هنا ثم:
-   git add . && git commit -m "deploy" && git push
-   ```
-4. عدّل الـ `README.md` بتاع الـ Space وخلّي أول سطوره:
-   ```yaml
-   ---
-   title: Qattaas
-   emoji: ✂️
-   colorFrom: orange
-   colorTo: yellow
-   sdk: docker
-   app_port: 7860
-   ---
-   ```
-5. استنى البيلد (~3 دقايق) → التطبيق شغال على `https://USERNAME-qattaas.hf.space` 🎉
+### أ) Google Colab — مجاني 100% وصفر حسابات جديدة ✈️
+الريبو فيه نوتبوك جاهز — افتح اللينك واضغط **Run all** وهيظهرلك لينك عام بعد حوالي 3 دقائق:
 
-**حدود الخطة المجانية:** الـ Space بينام بعد 48 ساعة عدم استخدام (أول زيارة تاني بتوقظه في ثواني)، والتخزين مؤقت (بيرجع يفرغ مع إعادة التشغيل) — وده مش مشكلة: الـ jobs أصلاً بتتمسح بعد 24 ساعة، والمستخدم بياخد نتيجته قبلها. لو المعالجة اتقطعت بسبب restart، التطبيق بيكشفها لوحده وبيعرض "إعادة المحاولة".
+**[🚀 افتح قصّاص على كولاب بنقرة واحدة](https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb)**
+
+- العتاد: 2 vCPU + 12.7GB رام (أقوى من سيرفرات بـ$7 شهريًا!)
+- اللينك بيعيش مع الجلسة (~12 ساعة) — مناسب للاستخدام عند الحاجة
+- التخزين مؤقت داخل الجلسة — نزّل نتيجتك قبل القفل
+
+### ب) Modal — أقوى حل مجاني دائم 🏆 (الأفضل)
+حساب مجاني (تسجيل GitHub، بدون كارت) = **$30 كريدت شهريًا** + حاويات حقيقية scale-to-zero:
+
+```bash
+pip install modal
+modal token new        # تسجيل دخول مرة واحدة
+modal deploy modal_app.py
+```
+
+- 2 vCPU + 4GB — فيديو 110 دقيقة ≈ 9 دقائق رندر (نفس سرعة الساندبوكس بالضبط)
+- التكلفة الفعلية ~$0.07 للرندر الكامل ← الكريدت المجاني يكفي **~400 رندر شهريًا**
+- لينك ثابت + تخزين الـ jobs بيفضل بين التشغيلات
+
+### ج) Oracle Cloud Always Free — لمن يملك كارتًا دوليًا 💪
+4 أنوية ARM + 24GB رام + 200GB ديست **مجانًا للأبد** — أقوى عرض سحابي مجاني موجود، لكن التسجيل بيرفض حسابات كتير من مصر. الـ `Dockerfile` الجاهز يشتغل عليه زي الزيوت.
+
+> والدوكرفايل نفسه يشتغل على أي منصة تدعم Docker: Railway · Render · Fly.io · أي VPS.
 
 </div>
 
@@ -101,3 +104,5 @@ docker run -p 3000:3000 -v autocut-data:/app/storage autocut
 ```
 
 Deploys as-is to **Railway · Render · Fly.io · any VPS** — these run Docker with a real disk and real CPU, so uploads and rendering work end-to-end on a public URL.
+
+**Free non-local options (Oct 2026):** Hugging Face Docker Spaces now require a PRO subscription ($9/mo). The repo ships two free paths: `colab.ipynb` (one-click Google Colab, zero accounts — open in Colab, Run all, get a public URL) and `modal_app.py` (Modal, $30/month free credits, real containers, scale-to-zero). See the Arabic section above for links.
