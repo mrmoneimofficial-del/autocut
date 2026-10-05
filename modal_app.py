@@ -16,6 +16,9 @@
   - scale-to-zero: صفر تكلفة وقت الخمول
   - التكلفة الفعلية ~$0.07 للرندر الكامل ← الكريدت المجاني (~$30/شهر) يكفي ~400 رندر
   - تخزين الـ jobs على Modal Volume يفضل بين التشغيلات
+  - (اختياري) نسخة خارجية دائمة لكل نتيجة على Bunny Stream — أنشئ سر Modal مرة واحدة:
+        modal secret create bunny-stream BUNNY_STREAM_LIBRARY_ID=<رقم المكتبة> BUNNY_STREAM_API_KEY=<المفتاح>
+    ثم شيل علامة التعليق عن سطر secrets= في التابع تحت
 """
 
 import subprocess
@@ -34,6 +37,7 @@ storage = modal.Volume.from_name("qattaas-jobs", create_if_missing=True)
 @app.function(
     image=image,
     volumes={"/app/storage": storage},
+    # secrets=[modal.Secret.from_name("bunny-stream")],  # شيل التعليق بعد إنشاء السر (شوف فوق)
     cpu=2,                 # مثل الساندبوكس — 110 دقيقة فيديو ≈ 9 دقائق رندر
     memory=4096,
     timeout=3600,          # أقصى عمر للحاوية الواحدة (ساعة كاملة)

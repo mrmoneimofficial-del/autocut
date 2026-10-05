@@ -17,6 +17,7 @@ type Job = {
   uploadIntervals?: [number, number][]
   error?: string
   gofile?: { url: string }
+  bunny?: { url: string; guid: string }
   meta?: { durationMs: number; fps: number; width: number; height: number; sr: number; ch: number }
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
   output?: { size: number; durationMs: number; cutsCount: number }
@@ -738,14 +739,15 @@ export default function Home() {
                 >
                   <Eye className="w-4 h-4" /> معاينة النتيجة
                 </button>
-                {job!.gofile?.url && (
+                {(job!.gofile?.url || job!.bunny?.url) && (
                   <a
-                    href={job!.gofile.url}
+                    href={job!.bunny?.url || job!.gofile!.url}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm"
                   >
-                    <ExternalLink className="w-4 h-4" /> نسخة خارجية دائمة (GoFile)
+                    <ExternalLink className="w-4 h-4" />
+                    {job!.bunny ? 'المشاهدة على Bunny Stream (دائم)' : 'نسخة خارجية دائمة (GoFile)'}
                   </a>
                 )}
                 <div className="flex items-center justify-center gap-4 text-xs text-zinc-400 tabular-nums">
@@ -756,6 +758,11 @@ export default function Home() {
                 {job!.gofile?.url && (
                   <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
                     اللينك الخارجي من GoFile — بيعيش مع آخر تحميل منه (GoFile بيمسح الملفات غير النشطة تلقائيًا).
+                  </p>
+                )}
+                {job!.bunny?.url && (
+                  <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
+                    اللينك من Bunny Stream — لو لسه مش شغال، انتظر دقايق لحد ما الترميز على Bunny يخلص.
                   </p>
                 )}
               </div>

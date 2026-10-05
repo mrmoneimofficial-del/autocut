@@ -16,7 +16,7 @@
 - 🎛️ **3 إعدادات فقط** — طول الفجوة المتبقية، حساسية الكشف، الجودة
 - 📤 **رفع مقطّع موثوق** — قطع 8MB مع تتبع التقدم والسرعة وETA، واستكمال تلقائي بعد الانقطاع
 - 🇸🇦 **عربي بالكامل** — RTL بخط Cairo، تصميم أبيض/برتقالي نظيف
-- ☁️ **نسخة خارجية تلقائية** — بعد كل رندر ناجح، النتيجة بتترفع تلقائيًا على GoFile ولينك خارجي بيعيش حتى بعد ما السيرفر يقفل (مفيد جدًا مع كولاب). تعطيلها: `GOFILE_MIRROR=0`
+- ☁️ **نسخة خارجية تلقائية** — بعد كل رندر ناجح، النتيجة بتترفع تلقائيًا على **Bunny Stream** (لو مُفعّل — لينك دائم ببيلير جاهز) أو **GoFile** كاحتياطي، واللينك بيعيش حتى بعد ما السيرفر يقفل. الإعداد: `BUNNY_STREAM_LIBRARY_ID` + `BUNNY_STREAM_API_KEY` (و`BUNNY_STREAM_API_KEY_ALT` لمفتاح احتياطي)، وتعطيل الرفع الخارجي: `GOFILE_MIRROR=0` مع إزالة متغيرات Bunny. في ناسي رقم المكتبة؟ `bun scripts/find-bunny-library.mjs --from N --to M` بيلقية بمفتاحك
 
 ## 🔄 سير العمل
 
@@ -89,7 +89,7 @@ Blazing-fast video silence cutter with a minimal Arabic RTL UI (white/orange, Ca
 
 - **Engine**: single-file FFmpeg pipeline — `silencedetect` scan → frame-grid-aligned cut plan → streaming sample-accurate audio slicing → N≤8 parallel `libx264 ultrafast` video chunks → concat + single-step mux with duration verification.
 - **Stack**: Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · zero-DB (JSON job files).
-- **UI**: upload with chunked XHR → smart preview (auto-skip silence + interactive timeline) → 3 essential settings → parallel render with live progress → download + automatic GoFile mirror of the result (survives ephemeral hosts; disable with `GOFILE_MIRROR=0`).
+- **UI**: upload with chunked XHR → smart preview (auto-skip silence + interactive timeline) → 3 essential settings → parallel render with live progress → download + automatic external mirror of the result (Bunny Stream if `BUNNY_STREAM_*` env is set, else GoFile; survives ephemeral hosts).
 
 ```bash
 bun install && bun run dev   # requires ffmpeg on the host
