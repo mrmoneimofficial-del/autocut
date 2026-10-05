@@ -17,7 +17,7 @@ type Job = {
   uploadIntervals?: [number, number][]
   error?: string
   gofile?: { url: string }
-  bunny?: { url: string; guid: string }
+  bunny?: { url: string; guid: string; mp4?: string }
   meta?: { durationMs: number; fps: number; width: number; height: number; sr: number; ch: number }
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
   output?: { size: number; durationMs: number; cutsCount: number }
@@ -706,7 +706,7 @@ export default function Home() {
               <section className="rounded-2xl border border-orange-200 bg-orange-50/50 p-4 space-y-2">
                 <div className="flex items-center gap-2 text-sm font-bold text-orange-700">
                   <CloudUpload className="w-4 h-4 shrink-0" />
-                  نحفظ نسخة خارجية من النتيجة على GoFile…
+                  نحفظ نسخة خارجية من النتيجة…
                 </div>
                 <p className="text-xs text-zinc-500 leading-relaxed">دي مش بتأخر تحميلك — النتيجة جاهزة ونزّلها من الزر البرتقالي تحت، واللينك الخارجي هيظهر هنا خلال لحظات ويعيش حتى بعد ما السيرفر يقفل.</p>
               </section>
@@ -750,6 +750,17 @@ export default function Home() {
                     {job!.bunny ? 'المشاهدة على Bunny Stream (دائم)' : 'نسخة خارجية دائمة (GoFile)'}
                   </a>
                 )}
+                {job!.bunny?.mp4 && (
+                  <a
+                    href={job!.bunny.mp4}
+                    target="_blank"
+                    rel="noopener"
+                    className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm"
+                  >
+                    <Film className="w-4 h-4" />
+                    رابط MP4 مباشر من الـ CDN
+                  </a>
+                )}
                 <div className="flex items-center justify-center gap-4 text-xs text-zinc-400 tabular-nums">
                   <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {fmtTime(job!.output.durationMs)}</span>
                   <span className="flex items-center gap-1"><HardDrive className="w-3 h-3" /> {fmtMB(job!.output.size)}</span>
@@ -762,7 +773,7 @@ export default function Home() {
                 )}
                 {job!.bunny?.url && (
                   <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
-                    اللينك من Bunny Stream — لو لسه مش شغال، انتظر دقايق لحد ما الترميز على Bunny يخلص.
+                    اللينك من Bunny Stream وبيعيش للأبد — لو لسه مش شغال، انتظر دقيقة لحد ما الترميز يخلص. (لينك الـ MP4 افتحه بالضغط من هنا مباشرةً).
                   </p>
                 )}
               </div>

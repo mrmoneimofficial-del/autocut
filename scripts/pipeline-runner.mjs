@@ -23,7 +23,7 @@ const AR = {
   muxing: 'نجمّع الملف النهائي…',
   verifying: 'نتأكد من الملف النهائي…',
   cleanup: 'ننظف الملفات المؤقتة…',
-  mirroring: 'نحفظ نسخة خارجية من النتيجة (GoFile)…',
+  mirroring: 'نحفظ نسخة خارجية من النتيجة…',
   done: 'خلصنا! 🎉',
 }
 
@@ -323,6 +323,23 @@ async function mirrorToGoFile(file, name) {
 }
 
 // ---------------------------------------------------------------- bunny stream mirror
+/** best direct-MP4 URL for a Bunny video (needs BUNNY_CDN_HOST + resolutions) */
+function bunnyBestMp4(guid, resos) {
+  const cdn = String(process.env.BUNNY_CDN_HOST || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '')
+  if (!cdn || !resos) return null
+  const best = String(resos).split(',').map((r) => parseInt(r, 10)).filter((n) => n > 0).sort((a, b) => b - a)[0]
+  return best ? `https://${cdn}/${guid}/play_${best}p.mp4` : null
+}
+/** Stream zones block referer-less requests — verify with the embed page as referer */
+async function bunnyMp4Works(mp4, referer) {
+  try {
+    const h = await fetch(mp4, { method: 'HEAD', headers: { referer }, signal: AbortSignal.timeout(20_000) })
+    if (h.ok) return true
+    logStd(`bunny: mp4 HEAD ${h.status} — dropping direct link`)
+  } catch { /* network hiccup → treat as unavailable */ }
+  return false
+}
+
 /**
  * Best-effort mirror of the final file to Bunny Stream (paid CDN, survives
  * everything, gives a hosted player page). Preferred over GoFile when
@@ -330,8 +347,12 @@ async function mirrorToGoFile(file, name) {
  *   BUNNY_STREAM_LIBRARY_ID — the numeric library id (Stream → library → API)
  *   BUNNY_STREAM_API_KEY    — the library API key (UUID)
  *   BUNNY_STREAM_API_KEY_ALT — optional second key to try (same library)
+ *   BUNNY_CDN_HOST — optional library CDN host (e.g. vz-xxx.b-cdn.net): enables a
+ *     direct MP4 link (best encoded resolution). Note: Stream zones block
+ *     referer-less requests, so that link is meant to be CLICKED from a page
+ *     (e.g. our UI) — the embed player link always works everywhere.
  *   BUNNY_API_BASE / BUNNY_EMBED_BASE — overrides for testing/self-hosting
- * Never throws — returns { url, guid } on success, null otherwise.
+ * Never throws — returns { url, guid, mp4? } on success, null otherwise.
  */
 async function mirrorToBunnyStream(file, name) {
   const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
@@ -382,39 +403,83 @@ async function mirrorToBunnyStream(file, name) {
     })
     if (!up.ok) throw new Error(`bunny upload ${up.status} ${(await up.text().catch(() => '')).slice(0, 160)}`)
 
-    // 3. poll encoding (status 4 = finished) — capped so long encodes don't block `done`
+    // 3. short encode poll — status 4 = finished, availableResolutions = MP4s
+    //    ready. If the encode queue is slow we don't block `done`: the embed
+    //    link works on its own and a post-done catch-up adds the MP4 link later.
     let status = -1
-    for (let i = 0; i < 10; i++) {
+    let resos = null
+    let last = null
+    for (let i = 0; i < 6; i++) {
       await new Promise((r) => setTimeout(r, i === 0 ? 4000 : 12000))
       try {
-        const v = await jReq(`/videos/${guid}`, key)
-        status = Number(v.status ?? -1)
-        if (status === 4) break
+        last = await jReq(`/videos/${guid}`, key)
+        status = Number(last.status ?? -1)
+        resos = last.availableResolutions || null
+        const ep = Math.round(Number(last.encodeProgress ?? 0))
+        if (ep > 0 && ep < 100) {
+          mirrorStageText = `${AR.mirroring} (ترميز Bunny ${ep}%)`
+          progress({ phase: 'mirroring', stage: mirrorStageText, pct: 99 })
+        }
+        if (status === 4 || resos) break
         if (status === 5 || status === 6) throw new Error(`bunny encode status ${status}`)
       } catch (e) {
         if (String(e.message).includes('status 5') || String(e.message).includes('status 6')) throw e
         // transient poll failure → keep waiting
       }
     }
-    const url = v => (v && v.iframeSrc ? `https:${v.iframeSrc}` : null)
-    let embed = null
-    try { embed = url(await jReq(`/videos/${guid}`, key)) } catch { /* iframeSrc optional */ }
-    logStd(`bunny: mirrored ${guid} (encode status ${status})`)
-    return { url: embed || `${EMBED}/${libId}/${guid}`, guid }
+    const embed = last && last.iframeSrc ? `https:${last.iframeSrc}` : `${EMBED}/${libId}/${guid}`
+    let mp4 = bunnyBestMp4(guid, resos)
+    if (mp4 && !(await bunnyMp4Works(mp4, embed))) mp4 = null
+    logStd(`bunny: mirrored ${guid} (encode status ${status}${mp4 ? ', mp4 ready' : ''})`)
+    return { url: embed, guid, ...(mp4 ? { mp4 } : {}) }
   } catch (e) {
     logStd(`bunny mirror failed: ${e.message}`)
     return null
   }
 }
 
+/** after `done`: if the encode queue was slow, keep polling for the finished
+ *  encode and return the direct MP4 link (bounded ~8 min, never throws). */
+async function catchUpBunnyMp4(bunny) {
+  try {
+    const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
+    const key = String(process.env.BUNNY_STREAM_API_KEY || process.env.BUNNY_STREAM_API_KEY_ALT || '').trim()
+    if (!libId || !/^\d+$/.test(libId) || !key || !bunny.guid) return null
+    const API = (process.env.BUNNY_API_BASE || 'https://video.bunnycdn.com').replace(/\/$/, '')
+    let headFails = 0
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 12_000))
+      try {
+        const r = await fetch(`${API}/library/${libId}/videos/${bunny.guid}`, {
+          headers: { AccessKey: key, accept: 'application/json' },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!r.ok) continue
+        const v = await r.json().catch(() => null)
+        const mp4 = bunnyBestMp4(bunny.guid, v && v.availableResolutions)
+        if (!mp4) continue
+        // the MP4 file can lag a few seconds behind the resolutions metadata
+        // (transient 404 on the edge) → keep polling instead of giving up
+        if (await bunnyMp4Works(mp4, bunny.url)) return mp4
+        if (++headFails >= 5) return null // MP4 access genuinely unavailable
+      } catch { /* transient → keep waiting */ }
+    }
+    return null
+  } catch { return null }
+}
+
 /** output is on disk → mirror it externally → finish. Download stays available
  *  during the mirror (the UI shows the button from phase 'mirroring'). */
+let mirrorStageText = null // live stage text while a mirror uploads/polls
+
 async function finish(outPath, output) {
-  setPhase('mirroring', { output })
+  // drop stale mirror links from a previous render of the same job
+  setPhase('mirroring', { output, gofile: undefined, bunny: undefined })
+  mirrorStageText = null
   progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 })
   // heartbeat so the API stall-detector (10 min) never kills a long upload
   const hb = setInterval(() => {
-    try { progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 }) } catch { /* shutting down */ }
+    try { progress({ phase: 'mirroring', stage: mirrorStageText || AR.mirroring, pct: 99 }) } catch { /* shutting down */ }
   }, 15_000)
   const base = String(job.name || 'video').replace(/\.[^.]+$/, '') || 'video'
   const outName = `${base}-qattaas.mp4`
@@ -428,6 +493,24 @@ async function finish(outPath, output) {
   clearInterval(hb)
   setPhase('done', extField || {})
   progress({ phase: 'done', stage: AR.done, pct: 100 })
+  // post-done catch-up: slow Bunny encode queue → add the direct MP4 link when
+  // it appears; the UI picks it up on its next status poll (it keeps polling
+  // at `done`). Only writes if this guid is still the live one (re-render safe).
+  if (extField && extField.bunny && !extField.bunny.mp4) {
+    const mp4 = await catchUpBunnyMp4(extField.bunny)
+    if (mp4) {
+      try {
+        const j = JSON.parse(fs.readFileSync(jobFile, 'utf8'))
+        if (j.phase === 'done' && j.bunny && j.bunny.guid === extField.bunny.guid) {
+          j.bunny.mp4 = mp4
+          writeJSON(jobFile, j)
+          logStd(`bunny: mp4 link added post-done (${mp4})`)
+        }
+      } catch { /* best-effort */ }
+    } else {
+      logStd('bunny: mp4 catch-up ended without a link (encode too slow or blocked)')
+    }
+  }
 }
 
 // ---------------------------------------------------------------- video chunks

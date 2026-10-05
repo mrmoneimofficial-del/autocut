@@ -17,7 +17,7 @@
   - التكلفة الفعلية ~$0.07 للرندر الكامل ← الكريدت المجاني (~$30/شهر) يكفي ~400 رندر
   - تخزين الـ jobs على Modal Volume يفضل بين التشغيلات
   - (اختياري) نسخة خارجية دائمة لكل نتيجة على Bunny Stream — أنشئ سر Modal مرة واحدة:
-        modal secret create bunny-stream BUNNY_STREAM_LIBRARY_ID=<رقم المكتبة> BUNNY_STREAM_API_KEY=<المفتاح>
+        modal secret create bunny-stream BUNNY_STREAM_LIBRARY_ID=<رقم المكتبة> BUNNY_STREAM_API_KEY=<المفتاح> BUNNY_CDN_HOST=<hostname الـ CDN، اختياري>
     ثم شيل علامة التعليق عن سطر secrets= في التابع تحت
 """
 
