@@ -47,6 +47,34 @@ bun run dev     # http://localhost:3000
 
 > **ملاحظة:** المعالجة تعتمد على `ffmpeg` على السيرفر — المنصة السحابية بدون ffmpeg ستعرض الواجهة فقط دون قدرة على المعالجة. للنشر الكامل على لينك عام، استخدم `Dockerfile` المرفق (شوف قسم Docker بالأسفل).
 
+## ☁️ النشر المجاني الكامل — Hugging Face Spaces (الخيار الأفضل)
+
+**Hugging Face Spaces** بتديك مجانًا حاوية Docker حقيقية: **2 معالج vCPU + 16GB رام** — أقوى من سيرفرات كتير مدفوعة، ومناسبة تمامًا لمحرك القص (نفس سرعة جهازنا: فيديو 110 دقيقة ≈ 9 دقائق).
+
+**الخطوات (5 دقايق):**
+1. اعمل حساب مجاني على [huggingface.co](https://huggingface.co)
+2. من صفحتك → **New Space** → سمّيه `qattaas` → **Docker** → **CPU Basic (Free)**
+3. ارفع ملفات الريبو ده للـ Space (Dockerfile + باقي الملفات) — أوامر git مباشرة:
+   ```bash
+   git clone https://huggingface.co/spaces/USERNAME/qattaas && cd qattaas
+   # انسخ ملفات المشروع هنا ثم:
+   git add . && git commit -m "deploy" && git push
+   ```
+4. عدّل الـ `README.md` بتاع الـ Space وخلّي أول سطوره:
+   ```yaml
+   ---
+   title: Qattaas
+   emoji: ✂️
+   colorFrom: orange
+   colorTo: yellow
+   sdk: docker
+   app_port: 7860
+   ---
+   ```
+5. استنى البيلد (~3 دقايق) → التطبيق شغال على `https://USERNAME-qattaas.hf.space` 🎉
+
+**حدود الخطة المجانية:** الـ Space بينام بعد 48 ساعة عدم استخدام (أول زيارة تاني بتوقظه في ثواني)، والتخزين مؤقت (بيرجع يفرغ مع إعادة التشغيل) — وده مش مشكلة: الـ jobs أصلاً بتتمسح بعد 24 ساعة، والمستخدم بياخد نتيجته قبلها. لو المعالجة اتقطعت بسبب restart، التطبيق بيكشفها لوحده وبيعرض "إعادة المحاولة".
+
 </div>
 
 ---

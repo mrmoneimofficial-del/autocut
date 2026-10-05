@@ -22,12 +22,31 @@ function statusOf(id: string) {
   if (!job) return null
   const prog = readJSON(path.join(ROOT, id, 'progress.json'))
   const st: Record<string, any> = { ...job, progress: prog && ACTIVE.has(String(prog.phase)) ? prog : null }
+
   // live upload coverage — lets the client resume EXACTLY where it stopped
   if (st.phase === 'uploading') {
     const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(ROOT, id, 'chunks.json'))
     if (cov && Array.isArray(cov.intervals)) {
       st.uploaded = cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0)
       st.uploadIntervals = cov.intervals
+    }
+  }
+
+  // stall recovery — server/container restarts (e.g. host reboot, Space wake) kill the
+  // detached runner and the job would spin forever. If an active phase went quiet for
+  // 10+ minutes, flip to error so the user can hit "إعادة المحاولة".
+  if (ACTIVE.has(String(st.phase))) {
+    const mark = path.join(ROOT, id, 'progress.json')
+    let mtime = 0
+    try { mtime = fs.statSync(fs.existsSync(mark) ? mark : path.join(ROOT, id, 'job.json')).mtimeMs } catch { /* ignore */ }
+    if (mtime && Date.now() - mtime > 10 * 60_000) {
+      st.phase = 'error'
+      st.error = 'المعالجة اتوقفت فجأة (السيرفر اتعمل له ريستارت) — اضغط "إعادة المحاولة" وهنكمّل من عندها'
+      st.progress = null
+      const jobFile = path.join(ROOT, id, 'job.json')
+      try {
+        fs.writeFileSync(jobFile, JSON.stringify({ ...job, phase: 'error', error: st.error }))
+      } catch { /* concurrent write — next poll retries */ }
     }
   }
   return st
