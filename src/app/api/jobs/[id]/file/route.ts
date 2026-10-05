@@ -131,7 +131,9 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const url = new URL(req.url)
   const v = url.searchParams.get('v') === 'out' ? 'out' : 'src'
-  if (v === 'out' && job.phase !== 'done') return new Response('Not Found', { status: 404 })
+  // out.mp4 exists from phase 'mirroring' (mirror upload runs after render) —
+  // the UI offers download/preview during that bonus phase
+  if (v === 'out' && job.phase !== 'done' && job.phase !== 'mirroring') return new Response('Not Found', { status: 404 })
   const file = path.join(jobDirOf(id), v === 'out' ? 'out.mp4' : 'original' + job.ext)
   if (!fs.existsSync(file)) return new Response('Not Found', { status: 404 })
 

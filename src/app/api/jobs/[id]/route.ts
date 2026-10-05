@@ -7,7 +7,7 @@ export const runtime = 'nodejs'
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const RUNNER = path.join(process.cwd(), 'scripts', 'pipeline-runner.mjs')
-const ACTIVE = new Set(['uploading', 'analyzing', 'rendering'])
+const ACTIVE = new Set(['uploading', 'analyzing', 'rendering', 'mirroring'])
 
 type Ctx = { params: Promise<{ id: string }> }
 

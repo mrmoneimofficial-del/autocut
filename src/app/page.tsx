@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
-  AlertTriangle, CheckCircle2, Eye, FastForward, Clock,
+  AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink,
 } from 'lucide-react'
 
 /* ------------------------------------------------------------------ types */
@@ -12,10 +12,11 @@ type Job = {
   id: string
   name: string
   size: number
-  phase: 'uploading' | 'uploaded' | 'analyzing' | 'ready' | 'rendering' | 'done' | 'error'
+  phase: 'uploading' | 'uploaded' | 'analyzing' | 'ready' | 'rendering' | 'mirroring' | 'done' | 'error'
   uploaded: number
   uploadIntervals?: [number, number][]
   error?: string
+  gofile?: { url: string }
   meta?: { durationMs: number; fps: number; width: number; height: number; sr: number; ch: number }
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
   output?: { size: number; durationMs: number; cutsCount: number }
@@ -250,7 +251,7 @@ export default function Home() {
   // polling
   useEffect(() => {
     if (!job) return
-    const active = ['analyzing', 'rendering', 'uploaded'].includes(job.phase)
+    const active = ['analyzing', 'rendering', 'mirroring', 'uploaded'].includes(job.phase)
     const t = setInterval(() => refresh(job.id), active ? 1200 : 5000)
     return () => clearInterval(t)
   }, [job, refresh])
@@ -509,7 +510,7 @@ export default function Home() {
   const meta = job!.meta
   const plan = job!.plan
   const prog = job!.progress
-  const isResult = view === 'out' && phase === 'done'
+  const isResult = view === 'out' && (phase === 'done' || phase === 'mirroring')
   const playingDuration = isResult ? job!.output?.durationMs : plan?.durationMs
   const statsChanged = plan && (plan.settings.gapMs !== gapMs || plan.settings.thresholdDb !== thr)
 
@@ -522,7 +523,7 @@ export default function Home() {
         <section className="flex-1 min-h-0 flex flex-col p-4 sm:p-6 gap-4 order-1 lg:order-none">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="flex items-center gap-2 flex-wrap">
-              {phase === 'done' && (
+              {(phase === 'done' || phase === 'mirroring') && (
                 <div className="inline-flex rounded-xl border border-zinc-200 bg-zinc-50 p-1">
                   <SegBtn active={view === 'src'} onClick={() => setView('src')}>الأصلي</SegBtn>
                   <SegBtn active={view === 'out'} onClick={() => setView('out')}>النتيجة</SegBtn>
@@ -542,6 +543,12 @@ export default function Home() {
                 <span className="inline-flex items-center gap-2 rounded-xl bg-orange-50 border border-orange-200 px-3 h-9 text-sm font-bold text-orange-700">
                   <span className="w-2 h-2 rounded-full bg-orange-500 pulse-dot" />
                   بنقصّ الفيديو دلوقتي…
+                </span>
+              )}
+              {phase === 'mirroring' && (
+                <span className="inline-flex items-center gap-2 rounded-xl bg-orange-50 border border-orange-200 px-3 h-9 text-sm font-bold text-orange-700">
+                  <CloudUpload className="w-4 h-4" />
+                  نحفظ نسخة خارجية…
                 </span>
               )}
             </div>
@@ -629,11 +636,11 @@ export default function Home() {
               <section className="rounded-2xl border border-zinc-200 overflow-hidden">
                 <div className="px-4 pt-4 pb-2 flex items-center justify-between">
                   <h2 className="font-black text-sm text-zinc-900">النتيجة المتوقعة</h2>
-                  {phase === 'done' && <span className="inline-flex items-center gap-1 text-xs font-bold text-orange-600"><CheckCircle2 className="w-3.5 h-3.5" /> تم القص</span>}
+                  {(phase === 'done' || phase === 'mirroring') && <span className="inline-flex items-center gap-1 text-xs font-bold text-orange-600"><CheckCircle2 className="w-3.5 h-3.5" /> تم القص</span>}
                 </div>
                 <div className="px-4 pb-4 space-y-2.5 text-sm">
                   <Row label="المدة الأصلية" value={fmtTime(plan.durationMs)} />
-                  <Row label="المدة بعد القص" value={fmtTime(phase === 'done' ? (job!.output?.durationMs ?? plan.keptMs) : plan.keptMs)} />
+                  <Row label="المدة بعد القص" value={fmtTime((phase === 'done' || phase === 'mirroring') ? (job!.output?.durationMs ?? plan.keptMs) : plan.keptMs)} />
                   <Row label="فجوات هتتشال" value={String(plan.cutsCount).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[+d])} />
                   <div className="flex items-center justify-between pt-2.5 border-t border-zinc-100">
                     <span className="text-zinc-500">التوفير</span>
@@ -649,8 +656,8 @@ export default function Home() {
             )}
 
             {/* settings */}
-            {(phase === 'ready' || phase === 'rendering' || phase === 'done' || phase === 'error') && (
-              <section className={`rounded-2xl border p-4 space-y-4 ${phase === 'rendering' ? 'border-zinc-200 opacity-60' : 'border-zinc-200'}`}>
+            {(phase === 'ready' || phase === 'rendering' || phase === 'mirroring' || phase === 'done' || phase === 'error') && (
+              <section className={`rounded-2xl border p-4 space-y-4 ${(phase === 'rendering' || phase === 'mirroring') ? 'border-zinc-200 opacity-60' : 'border-zinc-200'}`}>
                 <h2 className="font-black text-sm">إعدادات القص</h2>
                 <Setting label="الفجوة المتبقية بين الكلام" hint="كل سكتة هيتساب منها قد إيه">
                   <select value={gapMs} disabled={phase === 'rendering'} onChange={(e) => setGapMs(+e.target.value)} className={selCls}>
@@ -693,6 +700,17 @@ export default function Home() {
               </section>
             )}
 
+            {/* action: external mirror (non-blocking bonus) */}
+            {phase === 'mirroring' && (
+              <section className="rounded-2xl border border-orange-200 bg-orange-50/50 p-4 space-y-2">
+                <div className="flex items-center gap-2 text-sm font-bold text-orange-700">
+                  <CloudUpload className="w-4 h-4 shrink-0" />
+                  نحفظ نسخة خارجية من النتيجة على GoFile…
+                </div>
+                <p className="text-xs text-zinc-500 leading-relaxed">دي مش بتأخر تحميلك — النتيجة جاهزة ونزّلها من الزر البرتقالي تحت، واللينك الخارجي هيظهر هنا خلال لحظات ويعيش حتى بعد ما السيرفر يقفل.</p>
+              </section>
+            )}
+
             {/* action: cut button */}
             {phase === 'ready' && (
               <button
@@ -704,8 +722,8 @@ export default function Home() {
               </button>
             )}
 
-            {/* action: download */}
-            {phase === 'done' && job!.output && (
+            {/* action: download (available from mirroring — output is already on disk) */}
+            {(phase === 'done' || phase === 'mirroring') && job!.output && (
               <div className="space-y-3">
                 <a
                   href={`/api/jobs/${job!.id}/file?v=out&dl=1`}
@@ -720,11 +738,26 @@ export default function Home() {
                 >
                   <Eye className="w-4 h-4" /> معاينة النتيجة
                 </button>
+                {job!.gofile?.url && (
+                  <a
+                    href={job!.gofile.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm"
+                  >
+                    <ExternalLink className="w-4 h-4" /> نسخة خارجية دائمة (GoFile)
+                  </a>
+                )}
                 <div className="flex items-center justify-center gap-4 text-xs text-zinc-400 tabular-nums">
                   <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {fmtTime(job!.output.durationMs)}</span>
                   <span className="flex items-center gap-1"><HardDrive className="w-3 h-3" /> {fmtMB(job!.output.size)}</span>
                   <span className="flex items-center gap-1"><CheckCircle2 className="w-3 h-3 text-orange-500" /> تزامن 100%</span>
                 </div>
+                {job!.gofile?.url && (
+                  <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
+                    اللينك الخارجي من GoFile — بيعيش مع آخر تحميل منه (GoFile بيمسح الملفات غير النشطة تلقائيًا).
+                  </p>
+                )}
               </div>
             )}
           </div>

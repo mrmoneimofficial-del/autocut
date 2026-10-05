@@ -23,6 +23,7 @@ const AR = {
   muxing: 'نجمّع الملف النهائي…',
   verifying: 'نتأكد من الملف النهائي…',
   cleanup: 'ننظف الملفات المؤقتة…',
+  mirroring: 'نحفظ نسخة خارجية من النتيجة (GoFile)…',
   done: 'خلصنا! 🎉',
 }
 
@@ -55,7 +56,8 @@ function writeJSON(file, obj) {
 }
 function setPhase(phase, extra = {}) {
   job.phase = phase
-  writeJSON(jobFile, { ...job, ...extra })
+  Object.assign(job, extra) // keep memory & disk in sync — later writes must not lose earlier extras
+  writeJSON(jobFile, job)
 }
 function progress(p) {
   writeJSON(progFile, { ...p, at: Date.now(), elapsedMs: Date.now() - t0 })
@@ -249,6 +251,93 @@ async function buildAudio(plan, onByte) {
   return { written, totalOut }
 }
 
+// ---------------------------------------------------------------- gofile mirror
+/**
+ * Best-effort mirror of the final file to GoFile (free file host) so the
+ * download link survives ephemeral hosts (Colab session end, container
+ * restarts). Never throws — returns { url } on success, null otherwise.
+ * Disable with env GOFILE_MIRROR=0.
+ */
+async function mirrorToGoFile(file, name) {
+  if (process.env.GOFILE_MIRROR === '0') return null
+  // GOFILE_API (advanced): point the mirror at another GoFile-compatible API —
+  // used for testing/self-hosting. Server entries containing ':' are treated as
+  // absolute origins (e.g. http://localhost:9876); plain names get .gofile.io.
+  const API_BASE = process.env.GOFILE_API || 'https://api.gofile.io'
+  const cacheFile = path.join(ROOT, '..', '.gofile.json')
+  const jGet = async (url, opts) => {
+    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30_000) })
+    const j = await r.json().catch(() => null)
+    if (!j || j.status !== 'ok') throw new Error(`gofile api ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
+    return j.data
+  }
+  try {
+    let { token, server } = (() => {
+      try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')) } catch { return {} }
+    })()
+    if (!token) {
+      const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
+      token = acc.token
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!server) {
+        const d = await jGet(`${API_BASE}/servers`)
+        const servers = (d.servers || []).map((s) => s.name).filter(Boolean)
+        if (!servers.length) throw new Error('no gofile servers available')
+        server = servers[Math.floor(Math.random() * servers.length)]
+      }
+      try {
+        // stream from disk when the runtime supports it; fall back to a buffer
+        let blob
+        try { blob = await fs.promises.openAsBlob(file) }
+        catch { blob = new Blob([await fs.promises.readFile(file)]) }
+        const fd = new FormData()
+        fd.append('file', blob, name)
+        fd.append('token', token)
+        const origin = /^[a-z0-9.-]+$/i.test(server) ? `https://${server}.gofile.io` : `http://${server}`
+        const r = await fetch(`${origin}/contents/uploadfile`, {
+          method: 'POST', body: fd, signal: AbortSignal.timeout(30 * 60_000),
+        })
+        const j = await r.json().catch(() => null)
+        if (!j || j.status !== 'ok') throw new Error(`upload failed ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
+        try { fs.writeFileSync(cacheFile, JSON.stringify({ token, server })) } catch { /* cache is best-effort */ }
+        logStd(`gofile: mirrored to ${j.data.downloadPage} (${server})`)
+        return { url: j.data.downloadPage }
+      } catch (e) {
+        logStd(`gofile attempt ${attempt + 1} on ${server} failed: ${e.message}`)
+        server = null
+        // token may be stale → fresh guest account for the retry
+        if (attempt === 0) {
+          try {
+            const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
+            token = acc.token
+          } catch (e2) { logStd(`gofile token refresh failed: ${e2.message}`) }
+        }
+      }
+    }
+    return null
+  } catch (e) {
+    logStd(`gofile mirror skipped: ${e.message}`)
+    return null
+  }
+}
+
+/** output is on disk → mirror it externally → finish. Download stays available
+ *  during the mirror (the UI shows the button from phase 'mirroring'). */
+async function finish(outPath, output) {
+  setPhase('mirroring', { output })
+  progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 })
+  // heartbeat so the API stall-detector (10 min) never kills a long upload
+  const hb = setInterval(() => {
+    try { progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 }) } catch { /* shutting down */ }
+  }, 15_000)
+  const base = String(job.name || 'video').replace(/\.[^.]+$/, '') || 'video'
+  const gf = await mirrorToGoFile(outPath, `${base}-qattaas.mp4`)
+  clearInterval(hb)
+  setPhase('done', gf ? { gofile: gf } : {})
+  progress({ phase: 'done', stage: AR.done, pct: 100 })
+}
+
 // ---------------------------------------------------------------- video chunks
 function balanced(terms) {
   if (terms.length === 1) return terms[0]
@@ -333,8 +422,7 @@ async function render(settings) {
   if (plan.cutsCount === 0) {
     progress({ phase: 'rendering', stage: AR.muxing, pct: 50 })
     await ff(['-i', src, '-c', 'copy', '-movflags', '+faststart', outPath])
-    setPhase('done', { output: { size: fs.statSync(outPath).size, durationMs: plan.durationMs, cutsCount: 0 } })
-    progress({ phase: 'done', stage: AR.done, pct: 100 })
+    await finish(outPath, { size: fs.statSync(outPath).size, durationMs: plan.durationMs, cutsCount: 0 })
     logStd('done (no cuts, stream copy)')
     return
   }
@@ -392,8 +480,7 @@ async function render(settings) {
   fs.rmSync(partsDir, { recursive: true, force: true })
   fs.rmSync(path.join(dir, 'audio.m4a'), { force: true })
 
-  setPhase('done', { output: { size: parseInt(info.format.size, 10), durationMs: Math.round(vd * 1000), cutsCount: plan.cutsCount } })
-  progress({ phase: 'done', stage: AR.done, pct: 100 })
+  await finish(outPath, { size: parseInt(info.format.size, 10), durationMs: Math.round(vd * 1000), cutsCount: plan.cutsCount })
   logStd(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 }
 
