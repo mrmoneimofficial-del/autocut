@@ -45,7 +45,7 @@ bun install
 bun run dev     # http://localhost:3000
 ```
 
-> **ملاحظة:** المعالجة تعتمد على `ffmpeg` على السيرفر — المنصة السحابية بدون ffmpeg ستعرض الواجهة فقط دون قدرة على المعالجة.
+> **ملاحظة:** المعالجة تعتمد على `ffmpeg` على السيرفر — المنصة السحابية بدون ffmpeg ستعرض الواجهة فقط دون قدرة على المعالجة. للنشر الكامل على لينك عام، استخدم `Dockerfile` المرفق (شوف قسم Docker بالأسفل).
 
 </div>
 
@@ -62,3 +62,14 @@ Blazing-fast video silence cutter with a minimal Arabic RTL UI (white/orange, Ca
 ```bash
 bun install && bun run dev   # requires ffmpeg on the host
 ```
+
+## 🐳 Full deployment (UI + upload + processing) — Docker
+
+Serverless platforms (Vercel…) render the UI only: no persistent disk, a 4.5MB request-body cap, and no ffmpeg. For a fully-working public instance, the repo ships a `Dockerfile` that bundles everything (UI + API + the ffmpeg engine):
+
+```bash
+docker build -t autocut .
+docker run -p 3000:3000 -v autocut-data:/app/storage autocut
+```
+
+Deploys as-is to **Railway · Render · Fly.io · any VPS** — these run Docker with a real disk and real CPU, so uploads and rendering work end-to-end on a public URL.
