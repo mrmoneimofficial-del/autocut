@@ -19,13 +19,17 @@ export async function POST(req: Request) {
     }
     const ext = EXT_OK.has(path.extname(name).toLowerCase()) ? path.extname(name).toLowerCase() : '.mp4'
 
-    // storage must be writable — serverless deploys (Vercel…) have a read-only FS
+    // storage must be writable — serverless deploys (Vercel…) have a read-only FS.
+    // probe by CREATING a unique file: writing an existing one can pass even when
+    // new entries (job dirs) are blocked.
     try {
       fs.mkdirSync(ROOT, { recursive: true })
-      fs.writeFileSync(path.join(ROOT, '.probe'), String(Date.now()))
+      const probe = path.join(ROOT, `.probe-${Date.now().toString(36)}-${process.pid}`)
+      fs.writeFileSync(probe, 'ok')
+      fs.rmSync(probe, { force: true })
     } catch {
       return Response.json({
-        error: 'السيرفر ده للعرض بس — التخزين مش متاح هنا. شغّل التطبيق محليًا عشان الرفع والقص',
+        error: 'السيرفر ده للعرض بس — التخزين مش متاح هنا. محتاج نسخة شغّالة عشان الرفع والقص',
       }, { status: 503 })
     }
 

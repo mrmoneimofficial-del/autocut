@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
-  AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink,
+  AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket,
 } from 'lucide-react'
 
 /* ------------------------------------------------------------------ types */
@@ -213,6 +213,7 @@ function Timeline({ durationMs, cuts, playheadRef, onSeek, active }: {
 export default function Home() {
   const [job, setJob] = useState<Job | null>(null)
   const [jobErr, setJobErr] = useState<string | null>(null)
+  const [showcase, setShowcase] = useState(false) // server refused upload: read-only serverless host (Vercel…)
   const [up, setUp] = useState<{ file: File; sent: number; speed: number } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [view, setView] = useState<'src' | 'out'>('src')
@@ -260,6 +261,7 @@ export default function Home() {
   /* upload flow */
   const startUpload = useCallback(async (file: File) => {
     setJobErr(null)
+    setShowcase(false)
     setNotice(null)
     setUp({ file, sent: 0, speed: 0 })
     speedTracker.current = { last: 0, at: Date.now() }
@@ -288,7 +290,10 @@ export default function Home() {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: file.name, size: file.size }),
         })
-        if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
+        if (!r.ok) {
+          if (r.status === 503) setShowcase(true)
+          throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
+        }
         const { id: newId } = await r.json()
         id = String(newId)
         localStorage.setItem('qattaas:job', id)
@@ -336,7 +341,7 @@ export default function Home() {
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
-    setJob(null); setUp(null); setJobErr(null); setNotice(null); setView('src'); setSkip(true)
+    setJob(null); setUp(null); setJobErr(null); setNotice(null); setShowcase(false); setView('src'); setSkip(true)
   }
 
   /* smart skip + playhead */
@@ -396,8 +401,27 @@ export default function Home() {
             </div>
 
             {jobErr && (
-              <div className="mb-4 flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
+              <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
+                </div>
+                {showcase && (
+                  <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
+                    <a
+                      href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
+                      target="_blank"
+                      rel="noopener"
+                      className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600"
+                    >
+                      <Rocket className="w-4 h-4" />
+                      شغّل نسخة كاملة مجانًا على Google Colab
+                    </a>
+                    <span className="text-xs leading-5 text-red-600">
+                      النسخة دي للعرض بس (استضافة بدون تخزين). الرابط بيفتح لك سيرفر شغّال مجاني في دقيقة —
+                      ترفع الفيديو وتقصّه عادي، وفي آخره لينك دائم للنتيجة.
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
