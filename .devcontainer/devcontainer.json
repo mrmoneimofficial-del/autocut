@@ -1,0 +1,13 @@
+{
+  "name": "قصّاص — AutoCut",
+  "build": { "dockerfile": "../Dockerfile" },
+  "overrideCommand": false,
+  "remoteUser": "node",
+  "forwardPorts": [7860],
+  "portsAttributes": {
+    "7860": {
+      "label": "قصّاص (AutoCut)",
+      "onAutoForward": "openBrowser"
+    }
+  }
+}

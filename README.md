@@ -61,7 +61,17 @@ bun run dev     # http://localhost:3000
 - اللينك بيعيش مع الجلسة (~12 ساعة) — مناسب للاستخدام عند الحاجة
 - التخزين مؤقت داخل الجلسة — نزّل نتيجتك قبل القفل
 
-### ب) Modal — أقوى حل مجاني دائم 🏆 (الأفضل)
+### ب) GitHub Codespaces — بحساب GitHub اللي عندك بالفعل 🧑‍💻
+**120 ساعة معالجة مجانية شهريًا** (≈60 ساعة تشغيل على الجهاز 2-core) + 15GB تخزين — من غير أي حساب جديد:
+
+**[🧑‍💻 شغّل قصّاص على Codespaces بنقرة واحدة](https://codespaces.new/mrmoneimofficial-del/autocut)**
+
+- الريبو فيه `.devcontainer` جاهز: أول تشغيل بيبني نفس صورة الإنتاج بالظبط (UI + API + ffmpeg) ويشغّل السيرفر تلقائيًا على بورت 7860
+- من تبويب **Ports** بالأسفل: كليك يمين على 7860 ← **Port Visibility ← Public** ← انسخ اللينك وشاركه مع أي حد
+- (اختياري) لتفعيل روابط Bunny الدايمة: **GitHub ← Settings ← Codespaces ← Secrets** — ضيف `BUNNY_STREAM_LIBRARY_ID` و `BUNNY_STREAM_API_KEY` و `BUNNY_CDN_HOST` وحدد الريبو ده
+- الكودسبيس بينام بعد 30 دقيقة خمول (اللينك بيرجع أول ما تشغّله تاني من github.com/codespaces) — مناسب للاستخدام عند الحاجة
+
+### ج) Modal — أقوى حل مجاني دائم 🏆 (الأفضل لحل عام ثابت)
 حساب مجاني (تسجيل GitHub، بدون كارت) = **$30 كريدت شهريًا** + حاويات حقيقية scale-to-zero:
 
 ```bash
@@ -74,7 +84,7 @@ modal deploy modal_app.py
 - التكلفة الفعلية ~$0.07 للرندر الكامل ← الكريدت المجاني يكفي **~400 رندر شهريًا**
 - لينك ثابت + تخزين الـ jobs بيفضل بين التشغيلات
 
-### ج) Oracle Cloud Always Free — لمن يملك كارتًا دوليًا 💪
+### د) Oracle Cloud Always Free — لمن يملك كارتًا دوليًا 💪
 4 أنوية ARM + 24GB رام + 200GB ديست **مجانًا للأبد** — أقوى عرض سحابي مجاني موجود، لكن التسجيل بيرفض حسابات كتير من مصر. الـ `Dockerfile` الجاهز يشتغل عليه زي الزيوت.
 
 > والدوكرفايل نفسه يشتغل على أي منصة تدعم Docker: Railway · Render · Fly.io · أي VPS.
@@ -106,4 +116,4 @@ docker run -p 3000:3000 -v autocut-data:/app/storage autocut
 
 Deploys as-is to **Railway · Render · Fly.io · any VPS** — these run Docker with a real disk and real CPU, so uploads and rendering work end-to-end on a public URL.
 
-**Free non-local options (Oct 2026):** Hugging Face Docker Spaces now require a PRO subscription ($9/mo). The repo ships two free paths: `colab.ipynb` (one-click Google Colab, zero accounts — open in Colab, Run all, get a public URL) and `modal_app.py` (Modal, $30/month free credits, real containers, scale-to-zero). See the Arabic section above for links.
+**Free non-local options (Oct 2026):** Hugging Face Docker Spaces now require a PRO subscription ($9/mo). The repo ships three free paths: `colab.ipynb` (one-click Google Colab, zero accounts), `.devcontainer` (one-click GitHub Codespaces — [codespaces.new/mrmoneimofficial-del/autocut](https://codespaces.new/mrmoneimofficial-del/autocut), 120 free core-hours/month with a personal GitHub account), and `modal_app.py` (Modal, $30/month free credits, real containers, scale-to-zero). See the Arabic section above for details.

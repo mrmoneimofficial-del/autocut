@@ -7,8 +7,9 @@
 #
 # Free hosting notes (Oct 2026):
 #   * Hugging Face Spaces now requires a PRO subscription ($9/mo) for Docker SDK
-#   * Free alternatives shipped in this repo: colab.ipynb (one-click Colab) and
-#     modal_app.py (Modal — $30/month free credits, deploys THIS Dockerfile)
+#   * Free alternatives shipped in this repo: colab.ipynb (one-click Colab),
+#     .devcontainer (one-click GitHub Codespaces — builds THIS image, 120 free
+#     core-hrs/month) and modal_app.py (Modal — $30/month free credits)
 
 # ---------- build stage ----------
 FROM node:22-slim AS build

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
-  AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket,
+  AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket, Github,
 } from 'lucide-react'
 
 /* ------------------------------------------------------------------ types */
@@ -406,18 +406,29 @@ export default function Home() {
                   <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
                 </div>
                 {showcase && (
-                  <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-4">
-                    <a
-                      href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
-                      target="_blank"
-                      rel="noopener"
-                      className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600"
-                    >
-                      <Rocket className="w-4 h-4" />
-                      شغّل نسخة كاملة مجانًا على Google Colab
-                    </a>
+                  <div className="mt-3 flex flex-col gap-3">
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <a
+                        href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
+                        target="_blank"
+                        rel="noopener"
+                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600"
+                      >
+                        <Rocket className="w-4 h-4" />
+                        شغّل نسخة كاملة مجانًا على Google Colab
+                      </a>
+                      <a
+                        href="https://codespaces.new/mrmoneimofficial-del/autocut"
+                        target="_blank"
+                        rel="noopener"
+                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-red-300 bg-white px-4 py-2.5 text-sm font-bold text-red-700 shadow-sm transition hover:bg-red-50"
+                      >
+                        <Github className="w-4 h-4" />
+                        أو على GitHub Codespaces
+                      </a>
+                    </div>
                     <span className="text-xs leading-5 text-red-600">
-                      النسخة دي للعرض بس (استضافة بدون تخزين). الرابط بيفتح لك سيرفر شغّال مجاني في دقيقة —
+                      النسخة دي للعرض بس (استضافة بدون تخزين). الروابط دي بتفتحلك سيرفر شغال مجاني في دقيقة —
                       ترفع الفيديو وتقصّه عادي، وفي آخره لينك دائم للنتيجة.
                     </span>
                   </div>
