@@ -15,6 +15,7 @@
 - 🧠 **بريفيو ذكي** — شاهد الفيديو مع تخطي الصمت تلقائيًا قبل الرندر، وتايم لاين تفاعلي (الكلام رمادي / الصمت برتقالي)
 - 🎛️ **3 إعدادات فقط** — طول الفجوة المتبقية، حساسية الكشف، الجودة
 - 📤 **رفع مقطّع موثوق** — قطع 8MB مع تتبع التقدم والسرعة وETA، واستكمال تلقائي بعد الانقطاع
+- ☁️ **وضع السحابة للاستضافات بدون تخزين (زي Vercel)** — المتصفح بيترفع مباشر على سيرفرات GoFile، والقص بيحصل في طلب واحد مبثوث حيًا بنفس محرك FFmpeg — شوف «وضع السحابة» تحت
 - 🇸🇦 **عربي بالكامل** — RTL بخط Cairo، تصميم أبيض/برتقالي نظيف
 - ☁️ **نسخة خارجية تلقائية** — بعد كل رندر ناجح، النتيجة بتترفع تلقائيًا على **Bunny Stream** (لو مُفعّل — لينك دائم ببيلير جاهز) أو **GoFile** كاحتياطي، واللينك بيعيش حتى بعد ما السيرفر يقفل. الإعداد: `BUNNY_STREAM_LIBRARY_ID` + `BUNNY_STREAM_API_KEY` (و`BUNNY_STREAM_API_KEY_ALT` لمفتاح احتياطي)، و`BUNNY_CDN_HOST` اختياري لتفعيل رابط MP4 مباشر من الـ CDN (زونات Stream بتمنع الفتح المباشر بدون referer — اللينك يفتح بالضغط من الواجهة، والبيلير شغال في كل حتة)، وتعطيل الرفع الخارجي: `GOFILE_MIRROR=0` مع إزالة متغيرات Bunny. في ناسي رقم المكتبة؟ `bun scripts/find-bunny-library.mjs --from N --to M` بيلقية بمفتاحك
 
@@ -46,7 +47,22 @@ bun install
 bun run dev     # http://localhost:3000
 ```
 
-> **ملاحظة:** المعالجة تعتمد على `ffmpeg` على السيرفر — المنصة السحابية بدون ffmpeg ستعرض الواجهة فقط دون قدرة على المعالجة. للنشر الكامل على لينك عام، استخدم `Dockerfile` المرفق (شوف قسم Docker بالأسفل).
+> **ملاحظة:** على سيرفر فيه ffmpeg عادي، المسار الكامل شغال (رفع مقطّع + معاينة + قص دقيق). الاستضافات بدون تخزين (زي Vercel) بتدخل وضع السحابة تلقائيًا — شوف القسم اللي تحت.
+
+## ⚡ وضع السحابة — Vercel نفسها بقت ترفع وتقص ☁️
+
+أي نشر على استضافة serverless (قراءة فقط + حد 4.5MB لجسم الطلب) بيدخل **وضع السحابة** تلقائيًا من غير أي إعداد:
+
+1. **المتصفح بيترفع الفيديو مباشر على أسطول GoFile** (`upload.gofile.io` — الـ API بتاعتهم مدعوم رسميًا للمتصفحات) — الاستضافة مش بتشوف الملف خالص، فمفيش حدود رفع
+2. **القص بيحصل جوه طلب واحد**: السيرفر بينزّل الأصل من GoFile على `/tmp` مؤقت، بيشغّل نفس محرك القص بالظبط (ثنائيات `ffmpeg-static`/`ffprobe-static` متدمجة مع الدالة عبر `outputFileTracingIncludes`)، وبيرفع النتيجة على نفس مجلد GoFile — النتيجة والأصل في صفحة تنزيل واحدة
+3. **الأحداث بتبث للمتصفح حيًا** (NDJSON): تنزيل ← مسح ← ترميز بسرعة وETA ← رفع النتيجة
+4. **إعادة قص بإعدادات تانية من غير إعادة رفع** — الفيديو خلاص محفوظ على GoFile
+
+الحدود: ~`CLOUD_MAX_MB` (200 افتراضيًا) و300 ثانية للطلب (أقصى خطة Hobby مع Fluid Compute).
+
+متغيرات اختيارية: `CLOUD_MAX_MB` (حد الحجم)، `GOFILE_WT_SALT` (ملح توكن الموقع — gofile بيدوّره كل فترة؛ الافتراضي `12af056dacea0b` زي ما هو في wt.obf.js حاليًا)، `GOFILE_USER_AGENT` / `GOFILE_LANGUAGE` (لازم يطابقوا حساب التوكن)، و`GOFILE_API` / `GOFILE_UPLOAD_BASE` / `GOFILE_STORE_BASE` للاختبار الذاتي.
+
+**فحص ذاتي:** افتح `/api/cloud/diag` على أي نشر — بيقولك بالظبط إيه اللي شغال من شبكة الاستضافة دي (gofile بيحجب IPات مراكز البيانات على الحافة أحيانًا — لو التنزيل محجوب، الرفع من المتصفح بيفضل شغال والقص بيترشّح لكولاب/كودسبيسز).
 
 ## ☁️ النشر المجاني غير المحلي — الخيارات الحقيقية (أكتوبر 2026)
 
@@ -107,7 +123,7 @@ bun install && bun run dev   # requires ffmpeg on the host
 
 ## 🐳 Full deployment (UI + upload + processing) — Docker
 
-Serverless platforms (Vercel…) render the UI only: no persistent disk, a 4.5MB request-body cap, and no ffmpeg. For a fully-working public instance, the repo ships a `Dockerfile` that bundles everything (UI + API + the ffmpeg engine):
+Serverless platforms (Vercel…) automatically switch to **cloud mode**: the browser uploads directly to GoFile's fleet (CORS-enabled), then a single streamed request downloads the original server-side, runs the same bundled ffmpeg engine (`ffmpeg-static` traced into the function), and mirrors the result back to the same GoFile folder — live NDJSON progress, re-cut without re-upload, `CLOUD_MAX_MB` (default 200) + 300s budget. `/api/cloud/diag` self-reports what works from the host's network. For unlimited sizes / fully-local processing, use the `Dockerfile`:
 
 ```bash
 docker build -t autocut .
