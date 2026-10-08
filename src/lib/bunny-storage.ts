@@ -15,6 +15,9 @@
  *                                 used by the local bunny-mock for E2E tests)
  */
 
+import fs from 'node:fs'
+import path from 'node:path'
+
 const ZONE = process.env.BUNNY_STORAGE_ZONE || 'qattaas'
 const PASSWORD = process.env.BUNNY_STORAGE_PASSWORD || ''
 const READ_PASSWORD = process.env.BUNNY_STORAGE_READ_PASSWORD || PASSWORD
@@ -72,6 +75,40 @@ export async function bunnyUpload(
     throw new Error(`فشل رفع الملف على تخزين Bunny (${res.status}): ${text.slice(0, 180)}`)
   }
   return url
+}
+
+/**
+ * STREAM a file from disk straight to Bunny storage — the file never sits in
+ * RAM (a 200MB video buffered in memory OOM-killed the whole server in E2E;
+ * this variant keeps the footprint at ~one chunk regardless of file size).
+ * @param remotePath path inside the zone
+ * @param filePath   local file to upload
+ * @param size       exact byte size (Content-Length — Bunny needs it)
+ */
+export async function bunnyUploadFile(
+  remotePath: string,
+  filePath: string,
+  size: number,
+): Promise<string> {
+  const url = bunnyUrl(remotePath)
+  const fh = await fs.promises.open(filePath, 'r')
+  try {
+    const body = fh.readableWebStream({ type: 'file' }) as unknown as ReadableStream<Uint8Array>
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: { ...writeHeaders(), 'Content-Length': String(size) },
+      body,
+      // @ts-expect-error — duplex is required by fetch for streaming bodies
+      duplex: 'half',
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      throw new Error(`فشل رفع الملف على تخزين Bunny (${res.status}): ${text.slice(0, 180)}`)
+    }
+    return url
+  } finally {
+    await fh.close().catch(() => { /* already closed */ })
+  }
 }
 
 /**

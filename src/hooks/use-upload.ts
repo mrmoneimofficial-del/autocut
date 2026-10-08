@@ -3,10 +3,11 @@
 /**
  * قصّاص — SHARED upload workflow hook.
  * Ported from the مستر منعم src/hooks/use-upload.ts (single source of truth
- * for the upload DECISION logic): files ≥4MB go through the chunked pipeline
- * (progress %, speed, ETA, pause/resume/cancel, retry, resume); smaller files
- * use one simple XHR request. Both paths surface their progress through the
- * shared UploadProgressCard.
+ * for the upload DECISION logic). v2: the bar is set VERY low (256KB) —
+ * essentially every real video goes through the adaptive chunked pipeline
+ * (immune to proxy body caps / timeouts), and only tiny files use the one
+ * simple XHR request (with retries). Both paths surface their progress
+ * through the shared UploadProgressCard.
  */
 import { useCallback, useRef, useState } from 'react'
 import { uploadWithProgress } from '@/lib/upload'
@@ -18,11 +19,12 @@ import {
 } from '@/lib/chunked-upload'
 import type { SimpleUploadProgress } from '@/components/upload-progress-card'
 
-/** 4MB threshold — files at/above this use the chunked pipeline. A single
- *  request body MUST stay below Vercel's 4.5MB limit (413 above that), so
- *  both the threshold AND the chunk size are 4MB. MUST match the server's
- *  CHUNK_SIZE in /api/uploads/chunked/init. */
-const CHUNK_THRESHOLD = 4 * 1024 * 1024
+/**
+ * Files below this use the simple single-request path; anything bigger uses
+ * the adaptive chunked pipeline. A single request body MUST stay below
+ * Vercel's 4.5MB limit — 256KB is safely under ANY hostile proxy too.
+ */
+const CHUNK_THRESHOLD = 256 * 1024
 
 export interface UploadResult<T = any> {
   data: T
@@ -43,6 +45,8 @@ interface UploadParams<T = any> {
   onDone?: (data: T) => void
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
 export function useUpload() {
   const [uploading, setUploading] = useState(false)
   const [fileName, setFileName] = useState('')
@@ -56,14 +60,14 @@ export function useUpload() {
     setUploading(true)
     setFileName(file.name)
 
-    // ── Large files (≥4MB): chunked uploader with resume ──
+    // ── Real videos (≥256KB): adaptive chunked uploader with resume ──
     if (file.size >= CHUNK_THRESHOLD) {
       setChunkProgress({
         uploadedBytes: 0,
+        bankedBytes: 0,
         totalBytes: file.size,
         percent: 0,
-        uploadedChunks: 0,
-        totalChunks: Math.ceil(file.size / (4 * 1024 * 1024)),
+        chunkSize: 256 * 1024,
         speed: 0,
         eta: 0,
         status: 'uploading',
@@ -92,21 +96,32 @@ export function useUpload() {
       }
     }
 
-    // ── Small files (<4MB): simple single-request upload with progress ──
+    // ── Tiny files (<256KB): simple single-request upload (3 attempts) ──
     setSimpleProgress({ loaded: 0, total: file.size, percent: 0 })
     const ac = new AbortController()
     simpleAbortRef.current = ac
     try {
       const fd = new FormData()
       fd.append('file', file, file.name)
-      const data = await uploadWithProgress<T>({
-        url: opts.url || `${basePath}/simple`,
-        formData: fd,
-        signal: ac.signal,
-        onProgress: (p) => setSimpleProgress(p),
-      })
-      onDone?.(data)
-      return data
+      const url = opts.url || `${basePath}/simple`
+      let lastErr: any = null
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const data = await uploadWithProgress<T>({
+            url,
+            formData: fd,
+            signal: ac.signal,
+            onProgress: (p) => setSimpleProgress(p),
+          })
+          onDone?.(data)
+          return data
+        } catch (e: any) {
+          if (e?.name === 'CancelError' || ac.signal.aborted) return null
+          lastErr = e
+          if (attempt < 3) await sleep(1000 * attempt)
+        }
+      }
+      throw lastErr || new Error('فشل الرفع')
     } finally {
       setUploading(false)
       setSimpleProgress(null)

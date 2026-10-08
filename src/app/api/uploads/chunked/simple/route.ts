@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { EXT_OK, CHUNK_SIZE, sessionDirOf, writeMeta, sweepSessions, type SessionMeta } from '@/lib/upload-session'
+import { EXT_OK, MAX_CHUNK_BODY, sessionDirOf, writeMeta, sweepSessions, type SessionMeta } from '@/lib/upload-session'
 import { finalizeUpload } from '@/lib/upload-finalize'
 
 export const maxDuration = 120
@@ -22,7 +22,7 @@ export async function POST(req: Request) {
   if (!(file instanceof File) || file.size <= 0) {
     return NextResponse.json({ error: 'بيانات الملف غير مكتملة' }, { status: 400 })
   }
-  if (file.size >= CHUNK_SIZE) {
+  if (file.size >= MAX_CHUNK_BODY) {
     return NextResponse.json(
       { error: 'الملف ده حجمه أكبر من المسار البسيط — المفروض يتقطّع تلقائيًا' },
       { status: 400 },
@@ -56,9 +56,7 @@ export async function POST(req: Request) {
     fileName: file.name.slice(0, 200),
     mimeType: file.type || 'application/octet-stream',
     fileSize: file.size,
-    chunkSize: CHUNK_SIZE,
-    totalChunks: 1,
-    uploadedChunks: [0],
+    uploaded: [{ start: 0, end: file.size }],
     createdAt: Date.now(),
   }
   await writeMeta(sessionDir, meta)

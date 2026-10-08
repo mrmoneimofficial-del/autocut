@@ -3,8 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import {
-  UPLOADS_DIR, CHUNK_SIZE, EXT_OK, sessionDirOf,
-  writeMeta, sweepSessions, type SessionMeta,
+  EXT_OK, sessionDirOf, writeMeta, sweepSessions, type SessionMeta,
 } from '@/lib/upload-session'
 
 export const dynamic = 'force-dynamic'
@@ -12,9 +11,14 @@ export const runtime = 'nodejs'
 
 /**
  * POST /api/uploads/chunked/init — start a chunked upload session.
- * Body: { fileName, mimeType, fileSize } → { sessionId, chunkSize, totalChunks }
+ * Body: { fileName, mimeType, fileSize }
+ * → { sessionId, maxChunkSize, initialChunkSize }
  * (ported from the مستر منعم init route; قصّاص adds the video-only check and
  * the cloud size cap, and drops the admin guard — public tool).
+ *
+ * v2: no fixed chunkSize/totalChunks anymore — the client adapts the chunk
+ * size to the network (grows on success, shrinks when a proxy kills the
+ * request) and declares each chunk's byte range explicitly.
  */
 export async function POST(req: Request) {
   const body = await req.json().catch(() => null)
@@ -53,18 +57,19 @@ export async function POST(req: Request) {
     )
   }
 
-  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE)
   const meta: SessionMeta = {
     sessionId,
     fileName,
     mimeType: mimeType || 'application/octet-stream',
     fileSize,
-    chunkSize: CHUNK_SIZE,
-    totalChunks,
-    uploadedChunks: [],
+    uploaded: [],
     createdAt: Date.now(),
   }
   await writeMeta(sessionDir, meta)
 
-  return NextResponse.json({ sessionId, chunkSize: CHUNK_SIZE, totalChunks })
+  return NextResponse.json({
+    sessionId,
+    maxChunkSize: 4 * 1024 * 1024,
+    initialChunkSize: 256 * 1024,
+  })
 }

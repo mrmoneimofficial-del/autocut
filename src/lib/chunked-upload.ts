@@ -2,41 +2,62 @@
 
 /**
  * قصّاص — chunked uploader with progress, ETA, resume, retry.
- * Ported from the مستر منعم production upload system (src/lib/chunked-upload.ts).
+ * Ported from the مستر منعم production upload system (src/lib/chunked-upload.ts),
+ * hardened into v2 after the "progress bar restarts from scratch" incident:
  *
- * • 4MB chunks — MUST stay below Vercel's 4.5MB request-body limit (anything
- *   larger is rejected with 413) and MUST match the server's CHUNK_SIZE in
- *   /api/uploads/chunked/init.
- * • Sequential upload — one chunk in flight at a time (keeps the progress bar
- *   strictly monotonic and keeps serverless requests on the same warm instance).
- * • Real progress: within-chunk XHR progress on top of banked chunk bytes —
- *   a retry can rewind the display by at most ONE chunk (4MB), never restart.
- * • Auto retry: 5 attempts per chunk, 1.5s apart, network/5xx only.
- * • Resume: the status endpoint reports chunks already on the server; they are
- *   skipped entirely (wires the documented intent of the reference system) and
- *   a saved sessionId can resume an interrupted upload after a page reload.
+ * ROOT CAUSE (found in the wild): the preview gateway in front of the app
+ * KILLS request bodies it considers too big/slow. A fixed-4MB chunk POST
+ * dies mid-flight over and over — the browser's within-chunk progress climbs
+ * to ~20%, the request is killed, nothing is banked, the bar rewinds to 0
+ * and the same 4MB chunk is re-sent forever. ("بيحمل قطعة واحدة ويبدأ من الأول")
+ *
+ * THE FIX — adaptive chunks (TCP congestion-control style):
+ * • Chunks start SMALL (256KB) — small enough to pass any sane proxy cap and
+ *   fast enough (≈2.5s at 0.1MB/s) to beat any sane proxy timeout.
+ * • Every success GROWS the chunk ×2 (up to 4MB = Vercel's 4.5MB body cap
+ *   minus margin) → fast links are just as efficient as before.
+ * • Every failure SHRINKS ×2 (floor 64KB) and lowers the growth ceiling →
+ *   the uploader automatically converges to the largest size the network
+ *   actually lets through, whatever the mystery limit is.
+ * • Byte-range protocol (`?start=&len=`): the server banks landed RANGES, so
+ *   any byte that ever reached the server is NEVER re-sent (status resync
+ *   after every failure + on resume).
+ * • STRICT MONOTONIC DISPLAY: a high-water mark on the progress bar — it can
+ *   stay flat while a killed chunk is re-sent, but it can NEVER go backwards.
+ * • Sequential upload — one chunk in flight (keeps serverless requests on
+ *   the same warm instance and makes the bar deterministic).
  */
 import { api } from '@/lib/api-client'
 
 export interface ChunkProgress {
+  /** DISPLAY bytes — high-water mark, NEVER rewinds */
   uploadedBytes: number
+  /** server-confirmed bytes (may lag the display during a killed chunk) */
+  bankedBytes: number
   totalBytes: number
+  /** monotonic 0..100 */
   percent: number
-  uploadedChunks: number
-  totalChunks: number
-  /** Bytes/sec across recent chunks */
+  /** current adaptive chunk size (bytes) — shown in the UI as transparency */
+  chunkSize: number
+  /** Bytes/sec over a sliding window of recent chunks */
   speed: number
   /** Seconds remaining, estimated */
   eta: number
-  status: 'uploading' | 'merging' | 'done' | 'error' | 'paused'
+  status: 'uploading' | 'retrying' | 'merging' | 'done' | 'error' | 'paused'
   error?: string
 }
 
-// 4MB — MUST stay below Vercel's 4.5MB request-body limit and MUST match the
-// server's CHUNK_SIZE in the chunked init route (3 places, one golden rule).
-const SERVER_CHUNK_SIZE = 4 * 1024 * 1024
-const MAX_RETRIES = 5
-const RETRY_DELAY_MS = 1500
+// Adaptive sizing (must respect the server's MAX_CHUNK_BODY = 4MB).
+const MIN_CHUNK = 64 * 1024
+const MAX_CHUNK = 4 * 1024 * 1024
+const INITIAL_CHUNK = 256 * 1024
+const MAX_ATTEMPTS = 6          // consecutive failures at the same cursor → hard error
+const XHR_TIMEOUT_MS = 90_000   // generous; slow links send small chunks
+const MAX_BACKOFF_MS = 8_000
+/** consecutive successes needed before the growth ceiling recovers ×2 —
+ *  keeps a hard proxy cap from being re-probed too often while letting a
+ *  transient outage stop punishing throughput forever */
+const CEILING_RECOVERY_STREAK = 16
 
 /** Lightweight checksum from the chunk's first/last bytes + length. Good
  *  enough for transport integrity (matches the server's verifyChecksum). */
@@ -72,10 +93,13 @@ export interface ResumeSession {
   fileSize: number
 }
 
+/** one landed byte range [start, end) — mirrors the server's coverage */
+interface Range { start: number; end: number }
+
 interface UploadOpts {
   /** Base API path for the chunked endpoints, WITHOUT trailing slash.
    *  The uploader appends `/init`, `/{sessionId}/status`,
-   *  `/{sessionId}/chunk?index=…&c=…`, and `/{sessionId}/complete`. */
+   *  `/{sessionId}/chunk?start=…&len=…&c=…`, and `/{sessionId}/complete`. */
   basePath: string
   file: File
   onProgress: (p: ChunkProgress) => void
@@ -87,208 +111,278 @@ interface UploadOpts {
   signal?: AbortSignal
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** first byte NOT covered by the (possibly sparse) coverage set */
+function firstGap(coverage: Range[]): number {
+  let cursor = 0
+  for (const r of [...coverage].sort((a, b) => a.start - b.start)) {
+    if (r.start > cursor) break
+    cursor = Math.max(cursor, r.end)
+  }
+  return cursor
+}
+
+function rangeCovered(coverage: Range[], start: number, end: number): boolean {
+  let s = start
+  for (const r of [...coverage].sort((a, b) => a.start - b.start)) {
+    if (r.start > s) break
+    if (r.end > s) s = r.end
+    if (s >= end) return true
+  }
+  return s >= end
+}
+
+/** retryable transport failure (network reset / 5xx / timeout) */
+class RetryableError extends Error {}
+/** hard stop — message surfaces to the user */
+class FatalUploadError extends Error {}
+/** silent cancel — the session stays on the server for resume */
+class CancelledError extends Error {
+  constructor() { super('تم الإلغاء'); this.name = 'CancelledError' }
+}
+
 export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
   const { basePath, file, onProgress } = opts
   const totalBytes = file.size
-  const totalChunks = Math.ceil(totalBytes / SERVER_CHUNK_SIZE)
 
-  let uploadedBytes = 0
-  let uploadedChunksCount = 0
+  // ---- mutable upload state ----
   let sessionId: string | null = null
-  let resumed = false
-  let paused = false
   let cancelled = false
+  let paused = false
+  let finished = false
   let currentXhr: XMLHttpRequest | null = null
-  const chunkTimes: number[] = [] // recent chunk durations for speed estimate
+  let banked = 0 // server-confirmed bytes
+  let coverage: Range[] = []
+  let chunkSize = INITIAL_CHUNK
+  let ceiling = MAX_CHUNK // growth cap (lowered after each failure)
+  let successStreak = 0 // drives ceiling recovery after sustained success
+  let hwm = 0 // DISPLAY high-water mark — the bar NEVER goes below this
+
+  // sliding speed window: [bytes, ms] per recently-completed chunk
+  const speedWindow: Array<[number, number]> = []
 
   const progress: ChunkProgress = {
     uploadedBytes: 0,
+    bankedBytes: 0,
     totalBytes,
     percent: 0,
-    uploadedChunks: 0,
-    totalChunks,
+    chunkSize,
     speed: 0,
     eta: 0,
     status: 'uploading',
   }
 
-  const emit = () => {
-    progress.uploadedBytes = uploadedBytes
-    progress.uploadedChunks = uploadedChunksCount
-    progress.percent = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0
-    // Speed: average bytes/sec over recent chunks
-    const recent = chunkTimes.slice(-5)
+  let lastEmit = 0
+  const emit = (force = true) => {
+    const now = Date.now()
+    if (!force && now - lastEmit < 80) return // throttle React churn
+    lastEmit = now
+    progress.uploadedBytes = Math.min(hwm, totalBytes)
+    progress.bankedBytes = banked
+    progress.chunkSize = chunkSize
+    progress.percent = totalBytes > 0
+      ? Math.min(100, Math.floor((hwm / totalBytes) * 100))
+      : 0
+    const recent = speedWindow.slice(-8)
     if (recent.length > 0) {
-      const avgMs = recent.reduce((s, x) => s + x, 0) / recent.length
-      progress.speed = avgMs > 0 ? (SERVER_CHUNK_SIZE / avgMs) * 1000 : 0
-      const remainingBytes = totalBytes - uploadedBytes
-      progress.eta = progress.speed > 0 ? Math.ceil(remainingBytes / progress.speed) : 0
+      const bytes = recent.reduce((s, x) => s + x[0], 0)
+      const ms = recent.reduce((s, x) => s + x[1], 0)
+      progress.speed = ms > 0 ? (bytes / ms) * 1000 : 0
+      progress.eta = progress.speed > 0 ? Math.ceil((totalBytes - hwm) / progress.speed) : 0
     }
     onProgress({ ...progress })
   }
 
-  const uploadChunk = async (index: number): Promise<boolean> => {
-    if (cancelled || paused) return false
-    const start = index * SERVER_CHUNK_SIZE
-    const end = Math.min(start + SERVER_CHUNK_SIZE, totalBytes)
-    const blob = file.slice(start, end)
-    const buf = await blob.arrayBuffer()
-    const checksum = quickChecksum(buf)
+  /** authoritative resync with the server — banked bytes are never re-sent */
+  const resync = async () => {
+    const st = await api<{ bankedBytes?: number; coverage?: Range[]; complete?: boolean }>(
+      `${basePath}/${sessionId}/status`,
+    )
+    if (typeof st.bankedBytes === 'number') banked = st.bankedBytes
+    if (Array.isArray(st.coverage)) coverage = st.coverage
+    if (banked > hwm) hwm = banked // confirmed progress lifts the floor…
+    // …but the display NEVER drops below what the user already saw.
+    return st
+  }
 
-    return new Promise<boolean>((resolve) => {
-      let attempt = 0
-      const tryOnce = () => {
-        if (cancelled || paused) {
-          resolve(false)
-          return
-        }
+  /**
+   * Send ONE byte-range. Resolves with the server's fresh coverage.
+   * Throws RetryableError on transport failures, FatalUploadError otherwise.
+   */
+  const sendRange = (start: number, len: number): Promise<void> => {
+    return new Promise<void>((resolve, reject) => {
+      if (cancelled || paused) {
+        reject(new FatalUploadError('__paused__'))
+        return
+      }
+      const blob = file.slice(start, start + len)
+      blob.arrayBuffer().then((buf) => {
+        if (cancelled) { reject(new FatalUploadError('__cancelled__')); return }
+        const checksum = quickChecksum(buf)
         const xhr = new XMLHttpRequest()
         currentXhr = xhr
-        const chunkStart = Date.now()
-        xhr.open('POST', `${basePath}/${sessionId}/chunk?index=${index}&c=${checksum}`)
+        const t0 = Date.now()
+        let sentHigh = 0
+        xhr.open('POST', `${basePath}/${sessionId}/chunk?start=${start}&len=${len}&c=${checksum}`)
         xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            // Within-chunk progress on top of banked bytes — monotonic except
-            // for a ≤4MB dip when a failed chunk restarts (by design).
-            const partial = uploadedBytes + e.loaded
-            progress.uploadedBytes = Math.min(partial, totalBytes)
-            progress.percent = Math.round((progress.uploadedBytes / totalBytes) * 100)
-            onProgress({ ...progress })
+          if (e.lengthComputable && e.loaded > sentHigh) {
+            sentHigh = e.loaded
+            // within-chunk progress on top of banked bytes, high-water clamped
+            const shown = banked + e.loaded
+            if (shown > hwm) hwm = Math.min(shown, totalBytes)
+            progress.status = paused ? 'paused' : 'uploading'
+            emit(false)
           }
         }
-        xhr.onload = () => {
-          currentXhr = null
+        xhr.timeout = XHR_TIMEOUT_MS
+        const done = (fn: () => void) => { if (currentXhr === xhr) currentXhr = null; fn() }
+
+        xhr.onload = () => done(() => {
           if (xhr.status >= 200 && xhr.status < 300) {
-            const chunkDuration = Date.now() - chunkStart
-            chunkTimes.push(chunkDuration)
-            uploadedBytes = end
-            uploadedChunksCount++
-            emit()
-            resolve(true)
+            try {
+              const j = JSON.parse(xhr.responseText)
+              if (typeof j.bankedBytes === 'number') banked = j.bankedBytes
+              if (Array.isArray(j.coverage)) coverage = j.coverage
+            } catch { /* body unparseable — resync will fix */ }
+            const dt = Date.now() - t0
+            speedWindow.push([len, Math.max(1, dt)])
+            if (banked > hwm) hwm = Math.min(banked, totalBytes)
+            resolve()
           } else if (xhr.status === 0 || xhr.status >= 500) {
-            // Network/server error — retry
-            attempt++
-            if (attempt > MAX_RETRIES) {
-              progress.status = 'error'
-              progress.error = `فشل رفع الجزء ${index + 1} بعد ${MAX_RETRIES} محاولات`
-              emit()
-              resolve(false)
-            } else {
-              setTimeout(tryOnce, RETRY_DELAY_MS)
-            }
+            reject(new RetryableError(`السيرفر رد ${xhr.status}`))
+          } else if (xhr.status === 409) {
+            // overlap → resync coverage and let the loop re-target the gap
+            try {
+              const j = JSON.parse(xhr.responseText)
+              if (Array.isArray(j.coverage)) coverage = j.coverage
+              if (typeof j.bankedBytes === 'number') banked = j.bankedBytes
+            } catch { /* ignore */ }
+            resolve() // treated as success-with-resync: the loop recomputes cursor
+          } else if (xhr.status === 404) {
+            reject(new FatalUploadError('جلسة الرفع انتهت على السيرفر — ابدأ الرفع من جديد'))
           } else {
-            // Client error — don't retry
-            let msg = `فشل رفع الجزء ${index + 1} (${xhr.status})`
+            let msg = `فشل رفع الجزء (${xhr.status})`
             try {
               const j = JSON.parse(xhr.responseText)
               if (j.error) msg = j.error
             } catch { /* not JSON */ }
-            progress.status = 'error'
-            progress.error = msg
-            emit()
-            resolve(false)
+            reject(new FatalUploadError(msg))
           }
-        }
-        xhr.onerror = () => {
-          currentXhr = null
-          attempt++
-          if (attempt > MAX_RETRIES) {
-            progress.status = 'error'
-            progress.error = `انقطاع الاتصال أثناء رفع الجزء ${index + 1}`
-            emit()
-            resolve(false)
-          } else {
-            setTimeout(tryOnce, RETRY_DELAY_MS)
-          }
-        }
-        xhr.ontimeout = () => {
-          currentXhr = null
-          attempt++
-          if (attempt > MAX_RETRIES) {
-            progress.status = 'error'
-            progress.error = `انتهت مهلة الجزء ${index + 1}`
-            emit()
-            resolve(false)
-          } else {
-            setTimeout(tryOnce, RETRY_DELAY_MS)
-          }
-        }
-        xhr.timeout = 120000 // 2 min per chunk
+        })
+        xhr.onerror = () => done(() => reject(new RetryableError('انقطاع الاتصال')))
+        xhr.ontimeout = () => done(() => reject(new RetryableError('انتهت مهلة الجزء')))
+        xhr.onabort = () => done(() => reject(new CancelledError()))
         xhr.send(buf)
-      }
-      tryOnce()
+      }).catch(() => reject(new RetryableError('فشل قراءة الملف محليًا')))
     })
   }
 
   const done = (async (): Promise<any | null> => {
     try {
-      // 1. Init session (or reuse a saved one for this exact file)
+      // 1. Establish the session (reuse a saved one for this exact file)
       if (opts.resume && opts.resume.fileName === file.name && opts.resume.fileSize === file.size) {
         sessionId = opts.resume.sessionId
-      }
-      if (sessionId) {
         try {
-          await api(`${basePath}/${sessionId}/status`)
-          resumed = true // session still alive → continue where it stopped
+          await resync() // session alive → continue where it stopped
         } catch {
           sessionId = null // swept/expired → start fresh
         }
       }
       if (!sessionId) {
-        const initRes = await api<{ sessionId: string; chunkSize: number; totalChunks: number }>(
-          `${basePath}/init`,
-          { json: { fileName: file.name, mimeType: file.type, fileSize: file.size } },
-        )
+        const initRes = await api<{ sessionId: string }>(`${basePath}/init`, {
+          json: { fileName: file.name, mimeType: file.type, fileSize: file.size },
+        })
         sessionId = initRes.sessionId
+        banked = 0
+        coverage = []
       }
       opts.onSession?.(sessionId)
 
-      // 2. Check resume status — which chunks already landed on the server?
-      /** chunk indexes that are banked server-side (skip re-sending them) */
-      const uploadedSet = new Set<number>()
-      if (resumed) {
-        const status = await api<{ uploadedChunks: number[]; totalChunks: number }>(
-          `${basePath}/${sessionId}/status`,
-        )
-        for (const i of status.uploadedChunks || []) uploadedSet.add(Number(i))
-        for (const i of uploadedSet) {
-          uploadedChunksCount++
-          uploadedBytes += Math.min(SERVER_CHUNK_SIZE, totalBytes - i * SERVER_CHUNK_SIZE)
-        }
-        if (uploadedBytes > totalBytes) uploadedBytes = totalBytes
-      }
+      // 2. Authoritative start point: first byte the server does NOT have
+      await resync()
+      let cursor = firstGap(coverage)
+      hwm = Math.max(hwm, banked)
       emit()
 
-      // 3. Upload missing chunks sequentially
-      for (let i = 0; i < totalChunks; i++) {
+      // 3. Upload the missing bytes sequentially, adapting the chunk size
+      let attempts = 0
+      while (cursor < totalBytes) {
         if (cancelled) return null
-        // wait while paused
-        while (paused && !cancelled) {
-          await new Promise((r) => setTimeout(r, 300))
+        while (paused && !cancelled) await sleep(250)
+        if (cancelled) return null
+
+        const len = Math.min(chunkSize, totalBytes - cursor)
+        if (rangeCovered(coverage, cursor, cursor + len)) {
+          cursor = firstGap(coverage) // already banked — skip (resume case)
+          continue
         }
-        if (cancelled) return null
-        if (uploadedSet.has(i)) continue // banked on the server — never re-send
-        const ok = await uploadChunk(i)
-        if (!ok) return null
-        uploadedSet.add(i)
+
+        try {
+          await sendRange(cursor, len)
+          attempts = 0
+          cursor = firstGap(coverage) // server coverage is the truth
+          // grow toward the ceiling after each success
+          chunkSize = Math.min(ceiling, chunkSize * 2)
+          // after a long clean streak, let the ceiling recover too — a proxy
+          // that killed big chunks once shouldn't cap throughput forever
+          successStreak++
+          if (successStreak >= CEILING_RECOVERY_STREAK && ceiling < MAX_CHUNK) {
+            ceiling = Math.min(MAX_CHUNK, ceiling * 2)
+            successStreak = 0
+          }
+          progress.status = 'uploading'
+          emit()
+        } catch (e) {
+          if (e instanceof FatalUploadError) {
+            if (e.message === '__cancelled__' || e.message === '__paused__') return null
+            throw e
+          }
+          // RetryableError → shrink, backoff, resync, retry
+          attempts++
+          if (attempts >= MAX_ATTEMPTS) {
+            throw new FatalUploadError(
+              'الاتصال بيفصل الطلبات بشكل متكرر — لو انت على شبكة ضعيفة استنى شوية وجرّب تاني، أو جرّب شبكة تانية',
+            )
+          }
+          chunkSize = Math.max(MIN_CHUNK, Math.floor(chunkSize / 2))
+          ceiling = Math.min(ceiling, chunkSize) // never grow past a failing size this run
+          successStreak = 0
+          progress.status = 'retrying'
+          emit()
+          await sleep(Math.min(MAX_BACKOFF_MS, 1000 * 2 ** (attempts - 1)))
+          if (cancelled) return null
+          while (paused && !cancelled) await sleep(250)
+          if (cancelled) return null
+          await resync() // whatever landed is banked forever — continue from the gap
+          cursor = firstGap(coverage)
+          hwm = Math.max(hwm, banked)
+          emit()
+        }
       }
 
       if (cancelled) return null
 
       // 4. Merge + verify on server
       progress.status = 'merging'
-      progress.percent = 100
+      hwm = totalBytes
       emit()
 
       const completeRes = await api<any>(`${basePath}/${sessionId}/complete`, { json: {} })
+      finished = true
       progress.status = 'done'
       emit()
       return completeRes
     } catch (e: any) {
+      if (cancelled) return null
       progress.status = 'error'
-      progress.error = e.message || 'فشل الرفع'
+      progress.error = e?.message || 'فشل الرفع'
       emit()
-      return null
+      // surface the failure to the caller (the banner + retry button) — a
+      // resolve(null) here used to race the caller's ref-update effect and
+      // the error vanished silently (found in browser E2E).
+      if (e?.name === 'CancelledError' || cancelled) return null
+      throw e instanceof Error ? e : new Error(e?.message || 'فشل الرفع')
     }
   })()
 
@@ -298,12 +392,14 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
     cancel: () => {
       cancelled = true
       if (currentXhr) currentXhr.abort()
-      progress.status = 'error'
-      progress.error = 'تم الإلغاء'
-      emit()
+      if (!finished) {
+        progress.status = 'error'
+        progress.error = 'تم الإلغاء'
+        emit()
+      }
     },
     pause: () => {
-      if (!paused && progress.status === 'uploading') {
+      if (!paused && (progress.status === 'uploading' || progress.status === 'retrying')) {
         paused = true
         progress.status = 'paused'
         emit()

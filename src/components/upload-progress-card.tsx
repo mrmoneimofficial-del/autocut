@@ -70,6 +70,7 @@ export function UploadProgressCard({
 
   const isMerging = cp?.status === 'merging'
   const isPaused = cp?.status === 'paused'
+  const isRetrying = cp?.status === 'retrying'
   const percent = isChunked
     ? (cp?.percent ?? 0)
     : (sp?.percent ?? 0)
@@ -79,13 +80,20 @@ export function UploadProgressCard({
   const loaded = isChunked ? (cp?.uploadedBytes ?? 0) : (sp?.loaded ?? 0)
   const total = isChunked ? (cp?.totalBytes ?? 0) : (sp?.total ?? 0)
 
+  const tone: 'active' | 'success' | 'error' | 'idle' =
+    cp?.status === 'error' ? 'error'
+      : cp?.status === 'done' ? 'success'
+        : isMerging || isPaused ? 'idle'
+          : 'active'
   return (
-    <CardShell tone={isMerging || isPaused ? 'idle' : 'active'}>
+    <CardShell tone={tone}>
       <div className="flex items-center gap-3">
         {/* Icon */}
         <div className="shrink-0 w-9 h-9 rounded-lg bg-orange-500/10 text-orange-500 flex items-center justify-center">
           {isMerging ? (
             <Loader2 className="w-4 h-4 animate-spin" />
+          ) : isRetrying ? (
+            <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
           ) : (
             <FileUp className="w-4 h-4" />
           )}
@@ -101,13 +109,15 @@ export function UploadProgressCard({
               ? mergingLabel
               : isPaused
                 ? 'متوقف مؤقتاً'
-                : total > 0
-                  ? `${formatBytes(loaded)} / ${formatBytes(total)}`
-                  : formatBytes(loaded)}
-            {isChunked && cp && !isMerging && (
+                : isRetrying
+                  ? 'الاتصال اتقطع — بنصغّر القطعة ونكمّل من نفس النقطة'
+                  : total > 0
+                    ? `${formatBytes(loaded)} / ${formatBytes(total)}`
+                    : formatBytes(loaded)}
+            {isChunked && cp && !isMerging && !isRetrying && (
               <>
                 {' · '}
-                {cp.totalChunks > 0 && `${cp.uploadedChunks}/${cp.totalChunks} قطعة`}
+                {cp.chunkSize > 0 && `قطع ${formatBytes(cp.chunkSize)}`}
                 {cp.speed > 0 && ` · ${formatSpeed(cp.speed)}`}
                 {cp.eta > 0 && cp.status === 'uploading' && ` · ${formatEta(cp.eta)}`}
               </>
@@ -117,7 +127,7 @@ export function UploadProgressCard({
 
         {/* Pause / Resume / Cancel controls */}
         <div className="shrink-0 flex items-center gap-1">
-          {isChunked && chunkHandle && cp?.status === 'uploading' && (
+          {isChunked && chunkHandle && (cp?.status === 'uploading' || cp?.status === 'retrying') && (
             <button
               type="button"
               onClick={() => chunkHandle.pause()}
@@ -161,9 +171,9 @@ export function UploadProgressCard({
       </div>
       <div className="mt-1.5 flex items-center justify-between">
         <span className="text-[10px] text-zinc-500 tabular-nums font-bold">{rounded}%</span>
-        {isChunked && cp && cp.status === 'uploading' && cp.totalChunks > 0 && (
-          <span className="text-[10px] text-zinc-400 tabular-nums">
-            قطعة {cp.uploadedChunks} من {cp.totalChunks}
+        {isChunked && cp && (cp.status === 'uploading' || cp.status === 'retrying') && (
+          <span className={`text-[10px] tabular-nums ${isRetrying ? 'text-amber-600 font-bold' : 'text-zinc-400'}`}>
+            {isRetrying ? 'إعادة محاولة ذكية…' : `${formatBytes(loaded)} من ${formatBytes(total)}`}
           </span>
         )}
       </div>

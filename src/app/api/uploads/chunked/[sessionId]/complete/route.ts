@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import { createWriteStream } from 'node:fs'
 import path from 'node:path'
 import {
-  sessionDirOf, validSessionId, readMeta, type SessionMeta,
+  sessionDirOf, validSessionId, readMeta, coverageComplete, type SessionMeta,
 } from '@/lib/upload-session'
 import { finalizeUpload } from '@/lib/upload-finalize'
 
@@ -14,9 +14,10 @@ export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 /**
- * POST /api/uploads/chunked/:sessionId/complete — verify all chunks → merge
- * streamed to /tmp → byte-exact size check → Bunny Storage upload → (server
- * mode) stage a local job → signed asset ref.
+ * POST /api/uploads/chunked/:sessionId/complete — verify FULL byte coverage
+ * → merge chunks streamed to /tmp (in byte-range order) → byte-exact size
+ * check → Bunny Storage upload → (server mode) stage a local job → signed
+ * asset ref.
  * Ported from the مستر منعم complete route (asset record + Bunny upload),
  * adapted to قصّاص: no DB, video-only, signed delivery token in the response.
  */
@@ -36,28 +37,36 @@ export async function POST(_req: Request, { params }: { params: Promise<{ sessio
     return NextResponse.json({ error: 'جلسة الرفع غير موجودة أو منتهية' }, { status: 404 })
   }
 
-  // Verify all chunks present
-  if (meta.uploadedChunks.length !== meta.totalChunks) {
+  // Verify FULL byte coverage [0, fileSize) — no holes, no missing tail.
+  if (!coverageComplete(meta)) {
+    const banked = meta.uploaded.reduce((s, r) => s + (r.end - r.start), 0)
     return NextResponse.json(
       {
-        error: `ناقص ${meta.totalChunks - meta.uploadedChunks.length} جزء — اكتمل الرفع أولاً`,
-        missing: meta.totalChunks - meta.uploadedChunks.length,
+        error: `لسه فيه ${Math.max(1, Math.round((meta.fileSize - banked) / 1024))} ك.ب ناقصة — اكتمل الرفع أولاً`,
+        bankedBytes: banked,
+        fileSize: meta.fileSize,
       },
       { status: 400 },
     )
   }
 
-  // Merge chunks into one file (streamed to /tmp — never in RAM).
+  // Merge chunks into one file (streamed to /tmp — never in RAM). Backpressure
+  // is honoured (await 'drain'): without it the write queue buffers the WHOLE
+  // file in memory and the kernel OOM-kills the server on large videos.
+  const sorted = [...meta.uploaded].sort((a, b) => a.start - b.start)
   const tmpMergedPath = path.join(sessionDir, 'merged.bin')
   const writeStream = createWriteStream(tmpMergedPath)
   let totalWritten = 0
   try {
-    for (let i = 0; i < meta.totalChunks; i++) {
-      const chunkBuf = await fs.readFile(path.join(sessionDir, `${i}.chunk`))
+    for (const r of sorted) {
+      const chunkBuf = await fs.readFile(path.join(sessionDir, `${r.start}.chunk`))
       totalWritten += chunkBuf.length
-      await new Promise<void>((resolve, reject) => {
-        writeStream.write(chunkBuf, (err) => (err ? reject(err) : resolve()))
-      })
+      if (!writeStream.write(chunkBuf)) {
+        await new Promise<void>((resolve, reject) => {
+          writeStream.once('drain', resolve)
+          writeStream.once('error', reject)
+        })
+      }
     }
     await new Promise<void>((resolve, reject) => {
       writeStream.end((err: Error | null) => (err ? reject(err) : resolve()))
@@ -98,8 +107,8 @@ export async function POST(_req: Request, { params }: { params: Promise<{ sessio
     if (result.bunnyOK) {
       await fs.rm(sessionDir, { recursive: true, force: true })
     } else {
-      for (let i = 0; i < meta.totalChunks; i++) {
-        await fs.rm(path.join(sessionDir, `${i}.chunk`), { force: true })
+      for (const r of sorted) {
+        await fs.rm(path.join(sessionDir, `${r.start}.chunk`), { force: true })
       }
     }
   } catch { /* best-effort */ }

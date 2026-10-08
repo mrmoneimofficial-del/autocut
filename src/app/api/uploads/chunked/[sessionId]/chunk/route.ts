@@ -3,16 +3,26 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import {
   sessionDirOf, validSessionId, readMeta, writeMeta, verifyChecksum,
+  bankedBytes, isCovered, overlapsCoverage, MAX_CHUNK_BODY,
 } from '@/lib/upload-session'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 /**
- * POST /api/uploads/chunked/:sessionId/chunk?index=N&c=checksum
- * Body = the RAW chunk bytes. Idempotent (duplicate chunks are ignored →
- * safe with retries + resume), verifies expected byte size + the same sampled
- * checksum the client computes. Ported verbatim from the مستر منعم system.
+ * POST /api/uploads/chunked/:sessionId/chunk?start=S&len=L&c=checksum
+ * Body = the RAW chunk bytes for the byte range [S, S+L).
+ *
+ * PROTOCOL v2 — adaptive chunks: S and L are chosen by the client at runtime
+ * (it shrinks L when a proxy kills big/slow requests and grows it back on
+ * fast links). The server is size-agnostic: it only records which byte
+ * ranges have landed, which makes uploads immune to the "one chunk then
+ * restart" failure (whatever lands is banked forever; the client resumes
+ * from the exact first missing byte).
+ *
+ * Idempotent: a fully-covered range is skipped (safe with retries + resume).
+ * Partial overlap → 409 + current coverage (the client resyncs and sends
+ * only the uncovered remainder).
  */
 export async function POST(req: Request, { params }: { params: Promise<{ sessionId: string }> }) {
   const { sessionId } = await params
@@ -26,27 +36,52 @@ export async function POST(req: Request, { params }: { params: Promise<{ session
     return NextResponse.json({ error: 'جلسة الرفع غير موجودة أو منتهية' }, { status: 404 })
   }
 
-  // Chunk index comes from the query; the body is the raw chunk bytes.
   const url = new URL(req.url)
-  const index = parseInt(url.searchParams.get('index') || '', 10)
-  if (!Number.isFinite(index) || index < 0 || index >= meta.totalChunks) {
-    return NextResponse.json({ error: 'رقم الجزء غير صالح' }, { status: 400 })
+  const start = Number(url.searchParams.get('start'))
+  const len = Number(url.searchParams.get('len'))
+  if (!Number.isFinite(start) || !Number.isFinite(len) || start < 0 || len <= 0) {
+    return NextResponse.json({ error: 'نطاق الجزء غير صالح' }, { status: 400 })
+  }
+  if (len > MAX_CHUNK_BODY) {
+    return NextResponse.json(
+      { error: `حجم الجزء أكبر من الحد (${MAX_CHUNK_BODY} بايت) — صغّر القطع` },
+      { status: 400 },
+    )
+  }
+  if (start + len > meta.fileSize) {
+    return NextResponse.json(
+      { error: `النطاق برة الملف (الملف ${meta.fileSize} بايت)` },
+      { status: 400 },
+    )
   }
 
-  // Already uploaded? Skip (idempotent — supports resume).
-  if (meta.uploadedChunks.includes(index)) {
+  // Fully landed already? Skip (idempotent — supports resume + retries).
+  if (isCovered(meta, start, start + len)) {
     return NextResponse.json({
-      ok: true, uploaded: meta.uploadedChunks.length, total: meta.totalChunks, skipped: true,
+      ok: true,
+      skipped: true,
+      bankedBytes: bankedBytes(meta),
+      coverage: meta.uploaded,
     })
   }
 
-  // Read the chunk body and write it to disk. Each chunk is at most 4MB, so
+  // Partial overlap (client resync needed — it should send only the gap)
+  if (overlapsCoverage(meta, start, start + len)) {
+    return NextResponse.json(
+      {
+        error: 'النطاق بيتقاطع مع أجزاء اترفعت خلاص — زامن التغطية وابعت الفاضل بس',
+        coverage: meta.uploaded,
+      },
+      { status: 409 },
+    )
+  }
+
+  // Read the chunk body and write it to disk. Capped at MAX_CHUNK_BODY, so
   // holding one in memory is fine.
   const chunkBuf = Buffer.from(await req.arrayBuffer())
-  const expectedSize = Math.min(meta.chunkSize, meta.fileSize - index * meta.chunkSize)
-  if (chunkBuf.length !== expectedSize) {
+  if (chunkBuf.length !== len) {
     return NextResponse.json(
-      { error: `حجم الجزء غير متطابق (متوقع ${expectedSize}، مستلم ${chunkBuf.length})` },
+      { error: `حجم الجزء غير متطابق (متوقع ${len}، مستلم ${chunkBuf.length})` },
       { status: 400 },
     )
   }
@@ -59,14 +94,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ session
     return NextResponse.json({ error: 'فشل التحقق من سلامة الجزء — أعد الإرسال' }, { status: 422 })
   }
 
-  await fs.writeFile(path.join(sessionDir, `${index}.chunk`), chunkBuf)
-  meta.uploadedChunks.push(index)
-  meta.uploadedChunks.sort((a, b) => a - b)
+  // Bank the range: one chunk file per landed range, named by its start.
+  await fs.writeFile(path.join(sessionDir, `${start}.chunk`), chunkBuf)
+  meta.uploaded.push({ start, end: start + len })
   await writeMeta(sessionDir, meta)
 
   return NextResponse.json({
     ok: true,
-    uploaded: meta.uploadedChunks.length,
-    total: meta.totalChunks,
+    bankedBytes: bankedBytes(meta),
+    coverage: meta.uploaded,
   })
 }

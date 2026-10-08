@@ -167,6 +167,9 @@ export default function Home() {
   const viewRef = useRef<'src' | 'out'>('src')
   const cloudAbort = useRef<AbortController | null>(null)
   const lastChunkErrRef = useRef<string | null>(null)
+  /** the live chunked sessionId — lets a failed/cancelled upload resume from
+   *  the bytes already banked on the server instead of starting over */
+  const lastSidRef = useRef<string | null>(null)
 
   /* mode probe readiness — a picked file waits for this before choosing a path */
   const modeReadyRef = useRef<{ promise: Promise<'server' | 'cloud'>; resolve: (m: 'server' | 'cloud') => void } | null>(null)
@@ -231,11 +234,11 @@ export default function Home() {
             const st = await r.json()
             if (alive && st && !st.complete) {
               setSavedUpload({ sessionId: saved.sessionId, fileName: saved.fileName, fileSize: Number(saved.fileSize) })
-              setResumeInfo({ done: (st.uploadedChunks || []).length, total: Number(st.totalChunks || 0) })
+              setResumeInfo({ done: Number(st.bankedBytes || 0), total: Number(st.fileSize || saved.fileSize) })
             } else if (alive && st?.complete) {
               // session finished uploading but never completed → offer re-pick too
               setSavedUpload({ sessionId: saved.sessionId, fileName: saved.fileName, fileSize: Number(saved.fileSize) })
-              setResumeInfo({ done: Number(st.totalChunks || 0), total: Number(st.totalChunks || 0) })
+              setResumeInfo({ done: Number(st.fileSize || saved.fileSize), total: Number(st.fileSize || saved.fileSize) })
             } else if (alive) {
               localStorage.removeItem('qattaas:upload')
             }
@@ -351,6 +354,7 @@ export default function Home() {
         basePath: '/api/uploads/chunked',
         resume,
         onSession: (sid) => {
+          lastSidRef.current = sid
           // bookmark the session → a reload can resume exactly where we stopped
           try {
             localStorage.setItem('qattaas:upload', JSON.stringify({
@@ -360,8 +364,18 @@ export default function Home() {
         },
       })
     } catch (e: any) {
-      if (e?.name === 'CancelError') return // silent cancel (session kept for resume)
+      if (e?.name === 'CancelError' || e?.name === 'CancelledError') {
+        // cancelled → keep the session resumable from the banked bytes
+        if (lastSidRef.current) {
+          setSavedUpload({ sessionId: lastSidRef.current, fileName: file.name, fileSize: file.size })
+        }
+        return
+      }
       setJobErr(e?.message || 'فشل الرفع')
+      if (lastSidRef.current) {
+        // the retry button (and a reload) resume from the banked bytes — never from scratch
+        setSavedUpload({ sessionId: lastSidRef.current, fileName: file.name, fileSize: file.size })
+      }
       return
     }
 
@@ -369,10 +383,14 @@ export default function Home() {
       // cancelled → stay quiet (session kept for resume); error → surface it
       const err = lastChunkErrRef.current
       if (err && err !== 'تم الإلغاء') setJobErr(err)
+      if (lastSidRef.current) {
+        setSavedUpload({ sessionId: lastSidRef.current, fileName: file.name, fileSize: file.size })
+      }
       return
     }
 
     // success → the session is complete; drop the resume bookmark
+    lastSidRef.current = null
     try { localStorage.removeItem('qattaas:upload') } catch { /* noop */ }
     setSavedUpload(null)
     setResumeInfo(null)
@@ -630,7 +648,7 @@ export default function Home() {
                 onCancel={cancelUpload}
               />
               <p className="text-center text-xs text-zinc-400 leading-relaxed">
-                الفيديو بيتقسم قطع 4 م.ب وبيترفع قطعة قطعة بسرعة واستئناف تلقائي — وبعدها بيتحفظ على تخزين Bunny الدائم.
+                الفيديو بيترفع بقطع صغيرة ذكية بتتكيّف مع اتصالك — لو الشبكة ضعيفة بيصغّر القطعة ويكمّل من نفس النقطة، وبعدها بيتحفظ على تخزين Bunny الدائم.
               </p>
             </div>
           </main>
@@ -912,7 +930,7 @@ export default function Home() {
               onCancel={cancelUpload}
             />
             <p className="text-center text-xs text-zinc-400 leading-relaxed">
-              الفيديو بيتقسم قطع 4 م.ب وبيترفع قطعة قطعة بسرعة واستئناف تلقائي — وبعدها بيبدأ التحليل فورًا.
+              الفيديو بيترفع بقطع صغيرة ذكية بتتكيّف مع اتصالك — لو الشبكة ضعيفة بيصغّر القطعة ويكمّل من نفس النقطة، وبعدها بيبدأ التحليل فورًا.
             </p>
           </div>
         </main>
@@ -1219,7 +1237,7 @@ function ResumeCard({ saved, info, onPick, onDismiss }: {
           <div className="text-xs text-zinc-500">
             {info.done >= info.total
               ? 'الرفع خلص خلاص — اختار نفس الملف وهنكمّل فورًا'
-              : `${fmtBytesCard(info.done * 4 * 1024 * 1024)} من ${fmtBytesCard(saved.fileSize)} اترفعوا خلاص`}
+              : `${fmtBytesCard(info.done)} من ${fmtBytesCard(saved.fileSize)} اترفعوا خلاص`}
           </div>
         </div>
         <button onClick={onDismiss} title="تجاهل"

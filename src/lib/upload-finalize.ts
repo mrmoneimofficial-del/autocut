@@ -6,7 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { bunnyUpload, StoragePaths, mimeFromExt } from '@/lib/bunny-storage'
+import { bunnyUpload, bunnyUploadFile, StoragePaths, mimeFromExt } from '@/lib/bunny-storage'
 import { signPathToken } from '@/lib/storage-auth'
 import type { SessionMeta } from '@/lib/upload-session'
 
@@ -41,15 +41,23 @@ export async function finalizeUpload(meta: SessionMeta, mergedPath: string): Pro
   const safeName = `original${safeExt}`
 
   // ---- 1. upload the original to Bunny Storage (the system's core) ----
+  // STREAMED from disk — a 200MB video must never sit in RAM (the buffer
+  // path OOM-killed the whole server on 120MB files in E2E).
   let bunnyOK = false
   const remotePath = StoragePaths.original(meta.sessionId, safeName)
   if (process.env.BUNNY_STORAGE_PASSWORD) {
     try {
-      const buf = await fs.promises.readFile(mergedPath)
-      await bunnyUpload(remotePath, buf)
+      await bunnyUploadFile(remotePath, mergedPath, meta.fileSize)
       bunnyOK = true
     } catch (e) {
-      warnings.push(`تعذر حفظ الأصل على التخزين السحابي: ${e instanceof Error ? e.message : String(e)}`)
+      try {
+        // fallback: buffer upload (small files / stream-unsupported runtimes)
+        const buf = await fs.promises.readFile(mergedPath)
+        await bunnyUpload(remotePath, buf)
+        bunnyOK = true
+      } catch (e2) {
+        warnings.push(`تعذر حفظ الأصل على التخزين السحابي: ${e2 instanceof Error ? e2.message : String(e2)}`)
+      }
     }
   } else {
     warnings.push('التخزين السحابي (Bunny) مش متظبط على السيرفر ده — BUNNY_STORAGE_PASSWORD ناقص')

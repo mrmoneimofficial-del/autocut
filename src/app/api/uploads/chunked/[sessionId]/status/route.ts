@@ -1,13 +1,14 @@
 import { NextResponse } from 'next/server'
-import { sessionDirOf, validSessionId, readMeta } from '@/lib/upload-session'
+import { sessionDirOf, validSessionId, readMeta, bankedBytes, coverageComplete } from '@/lib/upload-session'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 /**
- * GET /api/uploads/chunked/:sessionId/status — which chunks already landed?
- * The client asks right after init/resume so it continues from where a
- * previous attempt stopped (ported verbatim from the مستر منعم system).
+ * GET /api/uploads/chunked/:sessionId/status — which BYTES already landed?
+ * The client asks right after init/resume (and after any failed chunk) so it
+ * continues from the exact first missing byte — banked bytes are never
+ * re-sent (ported from the مستر منعم status endpoint, v2 range-based).
  */
 export async function GET(_req: Request, { params }: { params: Promise<{ sessionId: string }> }) {
   const { sessionId } = await params
@@ -20,9 +21,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ session
   }
   return NextResponse.json({
     sessionId: meta.sessionId,
-    totalChunks: meta.totalChunks,
-    uploadedChunks: meta.uploadedChunks,
     fileSize: meta.fileSize,
-    complete: meta.uploadedChunks.length === meta.totalChunks,
+    bankedBytes: bankedBytes(meta),
+    coverage: meta.uploaded,
+    complete: coverageComplete(meta),
   })
 }

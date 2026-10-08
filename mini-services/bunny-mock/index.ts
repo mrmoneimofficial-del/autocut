@@ -36,6 +36,9 @@ const MIME: Record<string, string> = {
 
 const server = Bun.serve({
   port: PORT,
+  // real Bunny Storage accepts multi-GB PUTs; Bun's default 128MB cap made
+  // 200MB E2E uploads fail with 413 — raise it to match the real service
+  maxRequestBodySize: 1024 * 1024 * 1024,
   async fetch(req) {
     const url = new URL(req.url)
     const clean = decodeURIComponent(url.pathname).replace(/^\/+/, '')
