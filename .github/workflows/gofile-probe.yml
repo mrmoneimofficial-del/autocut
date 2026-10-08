@@ -127,9 +127,11 @@ jobs:
           echo '--- uploading results to paste services ---'
           URL1=$(curl -sS --max-time 60 -F 'file=@/tmp/probe-out.txt' https://0x0.st || true)
           echo "0x0.st: $URL1"
-          if [ -z "$URL1" ]; then
-            URL1=$(curl -sS --max-time 60 --data-binary @/tmp/probe-out.txt https://paste.c-net.org/ || true)
-            echo "paste.c-net.org: $URL1"
-          fi
           if [ -n "$URL1" ]; then echo "PROBE_RESULTS_URL=$URL1" >> "$GITHUB_STEP_SUMMARY"; fi
-          tail -c 4000 /tmp/probe-out.txt
+          # fixed-URL mirror so the results are readable without knowing any random URL
+          { echo "0x0 mirror: $URL1"; echo; cat /tmp/probe-out.txt; } > /tmp/probe-final.txt
+          curl -sS --max-time 60 -X POST \
+               --data-urlencode "content@/tmp/probe-final.txt" \
+               https://cl1p.net/qattaas-gofile-probe/ > /dev/null || echo 'cl1p post failed'
+          echo 'published to https://cl1p.net/qattaas-gofile-probe/'
+          tail -c 3000 /tmp/probe-out.txt
