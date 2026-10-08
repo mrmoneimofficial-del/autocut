@@ -1,13 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { signPathToken } from '@/lib/storage-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const RUNNER = path.join(process.cwd(), 'scripts', 'pipeline-runner.mjs')
-const ACTIVE = new Set(['uploading', 'analyzing', 'rendering', 'mirroring'])
+const ACTIVE = new Set(['analyzing', 'rendering', 'mirroring'])
 
 type Ctx = { params: Promise<{ id: string }> }
 
@@ -23,13 +24,13 @@ function statusOf(id: string) {
   const prog = readJSON(path.join(ROOT, id, 'progress.json'))
   const st: Record<string, any> = { ...job, progress: prog && ACTIVE.has(String(prog.phase)) ? prog : null }
 
-  // live upload coverage — lets the client resume EXACTLY where it stopped
-  if (st.phase === 'uploading') {
-    const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(ROOT, id, 'chunks.json'))
-    if (cov && Array.isArray(cov.intervals)) {
-      st.uploaded = cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0)
-      st.uploadIntervals = cov.intervals
-    }
+  // permanent download link for the finished result (Bunny Storage + signed
+  // token) — minted fresh on every poll so a restored tab keeps working
+  if (st.phase === 'done' && st.storage?.path) {
+    st.resultUrl = `/api/uploads/stream?t=${signPathToken(String(st.storage.path))}&dl=1`
+  }
+  if (st.phase === 'done' && st.asset?.path) {
+    st.originalUrl = `/api/uploads/stream?t=${signPathToken(String(st.asset.path))}`
   }
 
   // stall recovery — server/container restarts (e.g. host reboot, Space wake) kill the
@@ -61,7 +62,8 @@ export async function GET(_req: Request, ctx: Ctx) {
   return Response.json(st)
 }
 
-/** POST /api/jobs/:id — { action: 'analyze' } | { action:'render', gapMs, thresholdDb, crf } */
+/** POST /api/jobs/:id — { action: 'analyze' } | { action:'render', gapMs, thresholdDb, crf }
+ *  (jobs are staged as phase 'uploaded' by /api/uploads/chunked/complete) */
 export async function POST(req: Request, ctx: Ctx) {
   const { id } = await ctx.params
   if (!/^[a-f0-9]{32}$/.test(id)) return Response.json({ error: 'NOT_FOUND' }, { status: 404 })
@@ -74,14 +76,6 @@ export async function POST(req: Request, ctx: Ctx) {
   const action = body?.action
 
   if (action === 'analyze') {
-    // only from a fully-arrived file (coverage complete or phase already flipped)
-    if (job.phase === 'uploading') {
-      const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(dir, 'chunks.json'))
-      const covered = cov && Array.isArray(cov.intervals)
-        ? cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0) : 0
-      if (covered < job.size) return Response.json({ error: 'الرفع لسه مش خلص' }, { status: 409 })
-      job.phase = 'uploaded'
-    }
     if (job.phase !== 'uploaded' && job.phase !== 'error') {
       return Response.json({ error: 'الحالة الحالية مش صالحة للتحليل' }, { status: 409 })
     }
@@ -105,7 +99,9 @@ export async function POST(req: Request, ctx: Ctx) {
     job.error = undefined
     job.renderSettings = settings
     fs.writeFileSync(jobFile, JSON.stringify(job))
-    spawnRunner(id, 'render', JSON.stringify(settings))
+    // results go to the upload session folder on Bunny Storage
+    const resultDir = job.asset?.path ? `uploads/${String(job.asset.path).split('/')[1]}` : `uploads/${id}`
+    spawnRunner(id, 'render', JSON.stringify(settings), resultDir)
     return Response.json({ ok: true })
   }
 
@@ -113,14 +109,14 @@ export async function POST(req: Request, ctx: Ctx) {
 }
 
 /** Spawn the pipeline runner detached — it survives request end & HMR reloads. */
-function spawnRunner(id: string, action: string, settings?: string) {
+function spawnRunner(id: string, action: string, settings?: string, resultDir?: string) {
   const dir = jobDirOf(id)
   const logFd = fs.openSync(path.join(dir, 'spawn.log'), 'a')
   const child = spawn(process.execPath, [RUNNER, id, action, ...(settings ? [settings] : [])], {
     cwd: path.join(process.cwd(), 'scripts'),
     detached: true,
     stdio: ['ignore', logFd, logFd],
-    env: { ...process.env },
+    env: { ...process.env, ...(resultDir ? { QATTAAS_RESULT_DIR: resultDir } : {}) },
   })
   child.unref()
   setTimeout(() => { try { fs.closeSync(logFd) } catch { /* already closed */ } }, 10_000)

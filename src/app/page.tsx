@@ -1,11 +1,15 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
   AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket, Github,
-  Pause, Play, X, Cloud,
+  X, Cloud,
 } from 'lucide-react'
+import { useUpload } from '@/hooks/use-upload'
+import { UploadProgressCard } from '@/components/upload-progress-card'
+import type { ChunkProgress, ChunkedUploadHandle } from '@/lib/chunked-upload'
+import { formatBytes as fmtBytesCard } from '@/lib/chunked-upload'
 
 /* ------------------------------------------------------------------ types */
 type Cut = [number, number]
@@ -13,39 +17,44 @@ type Job = {
   id: string
   name: string
   size: number
-  phase: 'uploading' | 'uploaded' | 'analyzing' | 'ready' | 'rendering' | 'mirroring' | 'done' | 'error'
-  uploaded: number
-  uploadIntervals?: [number, number][]
+  phase: 'uploaded' | 'analyzing' | 'ready' | 'rendering' | 'mirroring' | 'done' | 'error'
   error?: string
-  gofile?: { url: string }
-  bunny?: { url: string; guid: string; mp4?: string }
+  asset?: { path: string; bunnyOK?: boolean }
+  storage?: { path: string; size: number }
+  resultUrl?: string
+  originalUrl?: string
   meta?: { durationMs: number; fps: number; width: number; height: number; sr: number; ch: number }
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
   output?: { size: number; durationMs: number; cutsCount: number }
   progress?: { phase: string; stage: string; pct: number; speedX?: number; etaSec?: number } | null
 }
 
-/* cloud mode — browser uploads directly to GoFile, server downloads + cuts + mirrors */
-type CloudRef = {
-  id: string
+/** the asset ref returned by /api/uploads/chunked/complete (signed) */
+type AssetRef = {
+  path: string
   name: string
   size: number
-  server?: string
-  guestToken?: string
-  parentFolder?: string
-  downloadPage?: string
+  token: string
+  mimeType?: string
 }
+type CompleteRes = {
+  asset: AssetRef
+  server?: { jobId: string }
+  bunnyOK: boolean
+  warning?: string
+}
+
+/** cloud mode — after the (shared) upload completes, the streamed cut runs */
 type CloudState = {
-  phase: 'uploading' | 'cutting' | 'done' | 'error'
-  file?: File
-  sent: number
-  speed: number
-  ref?: CloudRef
+  phase: 'cutting' | 'done' | 'error'
+  ref?: AssetRef
   cut?: { stage: string; pct: number; text?: string; speedX?: number; etaSec?: number }
   result?: { original?: string | null; resultUrl?: string | null; output?: any; plan?: any; meta?: any }
   error?: string
-  retryUpload?: boolean
 }
+
+/** an interrupted upload session saved in localStorage (same file → resume) */
+type SavedUpload = { sessionId: string; fileName: string; fileSize: number }
 
 const fmtTime = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -57,214 +66,6 @@ const fmtETA = (sec: number) => {
   if (sec < 90) return `${Math.max(5, Math.round(sec))} ثانية`
   if (sec < 5400) return `${Math.round(sec / 60)} دقيقة`
   return `${Math.round(sec / 3600)} ساعة`
-}
-
-/* -------------------------------------------------------------- uploading */
-const LANES = 4 // parallel upload lanes — saturates the pipe instead of waiting per-chunk
-
-function putChunk(jobId: string, offset: number, blob: Blob, sha: string, onLoaded: (n: number) => void, signal?: AbortSignal) {
-  return new Promise<{ ok: boolean; status: number; data: any }>((resolve) => {
-    const xhr = new XMLHttpRequest()
-    xhr.open('PUT', `/api/jobs/${jobId}/file?offset=${offset}`)
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
-    if (sha) xhr.setRequestHeader('X-Chunk-SHA256', sha)
-    xhr.upload.onprogress = (e) => onLoaded(e.loaded)
-    xhr.onload = () => {
-      let data: any = null
-      try { data = JSON.parse(xhr.responseText) } catch { /* empty */ }
-      resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data })
-    }
-    xhr.onerror = () => resolve({ ok: false, status: 0, data: null })
-    xhr.ontimeout = () => resolve({ ok: false, status: 0, data: null })
-    xhr.onabort = () => resolve({ ok: false, status: 0, data: null })
-    if (signal) {
-      if (signal.aborted) return resolve({ ok: false, status: 0, data: null })
-      signal.addEventListener('abort', () => xhr.abort(), { once: true })
-    }
-    xhr.timeout = 300000
-    xhr.send(blob)
-  })
-}
-
-function cancelErr() { return Object.assign(new Error('اتلغى الرفع'), { name: 'CancelError' }) }
-
-async function sha256Hex(blob: Blob): Promise<string> {
-  try {
-    const buf = await blob.arrayBuffer()
-    const h = await crypto.subtle.digest('SHA-256', buf)
-    let s = ''
-    const u = new Uint8Array(h)
-    for (let i = 0; i < u.length; i++) s += u[i].toString(16).padStart(2, '0')
-    return s
-  } catch { return '' } // very old browsers → skip integrity header
-}
-
-/** is chunk [s,e) fully inside the merged server intervals? */
-function chunkDone(intervals: [number, number][], s: number, e: number) {
-  for (const [a, b] of intervals) {
-    if (a >= e) break
-    if (a <= s && e <= b) return true
-  }
-  return false
-}
-
-/**
- * Resumable parallel uploader (gofile-style user control).
- * - 4 lanes pull chunk indexes from a shared queue (out-of-order server writes)
- * - every request carries SHA-256; server verifies before writing
- * - unlimited retries with capped backoff — and a failure NEVER costs progress:
- *   • the lane re-syncs with the server's coverage map first — bytes that
- *     already landed are banked forever and never re-sent
- *   • only the MISSING SUFFIX of a chunk is re-sent (not the whole 8MB)
- *   • the progress bar holds a high-water mark per lane, so a retry
- *     re-sends quietly under a flat bar — the user never sees it go backwards
- * - user can PAUSE (lanes drain gracefully, coverage kept) or CANCEL (throws)
- */
-async function uploadFile(
-  jobId: string,
-  file: File,
-  onProgress: (sent: number, lanes: number[]) => void,
-  onNotice: (msg: string) => void,
-  resumeIntervals?: [number, number][],
-  ctrl?: { paused: boolean; cancelled: boolean },
-  signal?: AbortSignal,
-): Promise<'done' | 'paused'> {
-  const CHUNK = 8 * 1024 * 1024
-  const size = file.size
-  const nChunks = Math.max(1, Math.ceil(size / CHUNK))
-
-  const covered: boolean[] = new Array(nChunks).fill(false)
-  let doneBytes = 0
-  if (resumeIntervals?.length) {
-    for (let i = 0; i < nChunks; i++) {
-      const s = i * CHUNK, e = Math.min(s + CHUNK, size)
-      if (chunkDone(resumeIntervals, s, e)) { covered[i] = true; doneBytes += e - s }
-    }
-    if (doneBytes > 0) onNotice(`كمّلنا من حيث وقفنا — ${fmtMB(doneBytes)} كانوا اترفعوا خلاص`)
-  }
-  onProgress(doneBytes, new Array(LANES).fill(0))
-
-  const queue: number[] = []
-  for (let i = 0; i < nChunks; i++) if (!covered[i]) queue.push(i)
-  if (queue.length === 0) return 'done'
-
-  const inflight: number[] = new Array(LANES).fill(0)
-  const report = () => onProgress(doneBytes + inflight.reduce((a, b) => a + b, 0), [...inflight])
-  const stopped = () => {
-    if (ctrl?.cancelled) throw cancelErr()
-    return !!ctrl?.paused
-  }
-
-  /* ---------- coverage helpers — the server's disk is the single truth ---------- */
-  /** restrict a global interval list to [s,e) */
-  const clipIv = (iv: [number, number][], s: number, e: number): [number, number][] => {
-    const out: [number, number][] = []
-    for (const [a, b] of iv || []) {
-      const lo = Math.max(a, s), hi = Math.min(b, e)
-      if (hi > lo) out.push([lo, hi])
-    }
-    return out
-  }
-  /** what's still missing inside [s,e) given a sorted+merged `have` list */
-  const missingIv = (have: [number, number][], s: number, e: number): [number, number][] => {
-    const out: [number, number][] = []
-    let cur = s
-    for (const [a, b] of have) {
-      if (a > cur) out.push([cur, Math.min(a, e)])
-      cur = Math.max(cur, b)
-      if (cur >= e) break
-    }
-    if (cur < e) out.push([cur, e])
-    return out.filter(([a, b]) => b > a)
-  }
-  /** merge one interval into a sorted+merged list (in place) */
-  const mergeInto = (have: [number, number][], iv: [number, number]) => {
-    have.push(iv)
-    have.sort((x, y) => x[0] - y[0])
-    const out: [number, number][] = []
-    for (const [a, b] of have) {
-      const last = out[out.length - 1]
-      if (last && a <= last[1]) last[1] = Math.max(last[1], b)
-      else out.push([a, b])
-    }
-    have.length = 0
-    have.push(...out)
-  }
-  const spanOf = (have: [number, number][]) => have.reduce((n, [a, b]) => n + (b - a), 0)
-  /** live coverage map from the server (null while it's unreachable) */
-  const fetchIv = async (): Promise<[number, number][] | null> => {
-    try {
-      const r = await fetch(`/api/jobs/${jobId}`, { cache: 'no-store' })
-      if (!r.ok) return null
-      const j = await r.json()
-      if (Array.isArray(j?.uploadIntervals)) {
-        return (j.uploadIntervals as unknown[]).map((x: any) => [Number(x[0]), Number(x[1])] as [number, number])
-      }
-      return null
-    } catch { return null }
-  }
-
-  const lane = async (li: number) => {
-    try {
-      while (true) { // chunk pump
-        if (stopped()) return
-        const idx = queue.shift()
-        if (idx === undefined) return
-        const start = idx * CHUNK, end = Math.min(start + CHUNK, size)
-        // what the server already holds of THIS chunk — resumes mid-chunk,
-        // so a re-pick after an interruption only sends the missing suffix
-        const have = clipIv(resumeIntervals || [], start, end)
-        inflight[li] = 0
-        let fails = 0
-        while (true) { // until this chunk is fully covered server-side
-          if (stopped()) return
-          const missing = missingIv(have, start, end)
-          if (missing.length === 0) break
-          const [rs, re] = missing[0]
-          const blob = file.slice(rs, re)
-          const sha = await sha256Hex(blob)
-          const base = rs - start // banked prefix of this chunk (not yet in doneBytes)
-          const res = await putChunk(jobId, rs, blob, sha, (loaded) => {
-            // high-water mark — a retry re-sends quietly, the bar never rewinds
-            const v = base + loaded
-            if (v > inflight[li]) { inflight[li] = v; report() }
-          }, signal)
-          if (res.ok) { mergeInto(have, [rs, re]); fails = 0; continue }
-          if (stopped()) return
-          if (res.status === 409) {
-            // server closed the upload phase (already complete) → lane done
-            if (res.data?.complete) return
-            throw new Error(res.data?.error || 'الرفع اتقفل من السيرفر')
-          }
-          // failed — before re-sending a single byte, sync with the server:
-          // whatever landed before the failure is banked forever
-          const spanBefore = spanOf(have)
-          const iv = await fetchIv()
-          if (iv) for (const [a, b] of clipIv(iv, start, end)) mergeInto(have, [a, b])
-          if (missingIv(have, start, end).length === 0) { fails = 0; break } // server had it all along
-          if (spanOf(have) > spanBefore) { fails = 0; continue } // banked → retry now, smaller target
-          fails++
-          if (res.status === 422 && fails >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
-          if (fails === 1) onNotice('مشكلة في النقل — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
-          else if (fails % 5 === 0) onNotice(`لسه بنحاول — محاولة ${fails + 1} (عند ${fmtMB(rs)})`)
-          // capped backoff in 200ms ticks so pause/cancel take effect instantly
-          const backoff = Math.min(8000, 700 * 2 ** Math.min(fails - 1, 4))
-          for (let t = 0; t < backoff; t += 200) {
-            if (stopped()) return
-            await new Promise((r) => setTimeout(r, 200))
-          }
-        }
-        inflight[li] = 0
-        doneBytes += end - start
-        report()
-      }
-    } finally {
-      inflight[li] = 0
-      report()
-    }
-  }
-  await Promise.all(Array.from({ length: LANES }, (_, i) => lane(i)))
-  return ctrl?.paused ? 'paused' : 'done'
 }
 
 /* --------------------------------------------------------------- timeline */
@@ -336,11 +137,7 @@ function Timeline({ durationMs, cuts, playheadRef, onSeek, active }: {
 export default function Home() {
   const [job, setJob] = useState<Job | null>(null)
   const [jobErr, setJobErr] = useState<string | null>(null)
-  const [showcase, setShowcase] = useState(false) // server refused upload: read-only serverless host (Vercel…)
-  const [up, setUp] = useState<{ file: File; sent: number; speed: number; lanes: number[] } | null>(null)
-  const [upPaused, setUpPaused] = useState(false)
   const [dragOver, setDragOver] = useState(false)
-  const [notice, setNotice] = useState<string | null>(null)
   const [view, setView] = useState<'src' | 'out'>('src')
   const [skip, setSkip] = useState(true)
   const [gapMs, setGapMs] = useState(200)
@@ -350,34 +147,45 @@ export default function Home() {
   const [srvMode, setSrvMode] = useState<'server' | 'cloud' | null>(null)
   const [cloudCutOK, setCloudCutOK] = useState(true)
   const [cloudMaxMB, setCloudMaxMB] = useState(200)
+  const [cloudBunny, setCloudBunny] = useState(true)
   const [cloud, setCloud] = useState<CloudState | null>(null)
+  /* upload session resume (the attached system's status/resume mechanism) */
+  const [savedUpload, setSavedUpload] = useState<SavedUpload | null>(null)
+  const [resumeInfo, setResumeInfo] = useState<{ done: number; total: number } | null>(null)
+  const [retryFile, setRetryFile] = useState<File | null>(null)
+
+  /* the ONE upload system — مستر منعم chunked uploader (both modes) */
+  const {
+    upload, uploading, fileName: upFileName,
+    chunkProgress, simpleProgress, chunkHandle, cancelSimple,
+  } = useUpload()
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const playheadRef = useRef<HTMLDivElement>(null)
   const cutsRef = useRef<Cut[]>([])
   const skipRef = useRef(true)
   const viewRef = useRef<'src' | 'out'>('src')
-  const speedTracker = useRef({ last: 0, at: 0 })
-  const upCtrl = useRef({ paused: false, cancelled: false })
-  const upAbort = useRef<AbortController | null>(null)
-  const upFileRef = useRef<File | null>(null)
-  const upIdRef = useRef<string>('')
-  /* mode probe promise — file picks await it so the right flow starts even if
-     the user drops a file before the probe lands */
-  const modeReadyRef = useRef<{ promise: Promise<'server' | 'cloud'>; resolve: (m: 'server' | 'cloud') => void } | null>(null)
-  if (!modeReadyRef.current) {
-    let resolve!: (m: 'server' | 'cloud') => void
-    const promise = new Promise<'server' | 'cloud'>((r) => { resolve = r })
-    modeReadyRef.current = { promise, resolve }
-  }
   const cloudAbort = useRef<AbortController | null>(null)
-  const startCloudRef = useRef<(f: File) => void>(() => {})
+  const lastChunkErrRef = useRef<string | null>(null)
+
+  /* mode probe readiness — a picked file waits for this before choosing a path */
+  const modeReadyRef = useRef<{ promise: Promise<'server' | 'cloud'>; resolve: (m: 'server' | 'cloud') => void } | null>(null)
+  if (modeReadyRef.current === null) {
+    let res!: (m: 'server' | 'cloud') => void
+    const p = new Promise<'server' | 'cloud'>((r) => { res = r })
+    modeReadyRef.current = { promise: p, resolve: res }
+  }
 
   useEffect(() => { skipRef.current = skip }, [skip])
   useEffect(() => { viewRef.current = view }, [view])
+  useEffect(() => { if (job?.plan) cutsRef.current = job.plan.cuts }, [job?.plan])
+
+  /* remember the last terminal error the uploader reported (the hook clears
+     its progress state once the promise settles — the page needs the message) */
   useEffect(() => {
-    if (job?.plan) cutsRef.current = job.plan.cuts
-  }, [job?.plan])
+    if (chunkProgress?.status === 'error' && chunkProgress.error) lastChunkErrRef.current = chunkProgress.error
+    if (chunkProgress?.status === 'uploading') lastChunkErrRef.current = null
+  }, [chunkProgress])
 
   const refresh = useCallback(async (id: string) => {
     try {
@@ -388,13 +196,14 @@ export default function Home() {
     } catch { /* offline tick */ }
   }, [])
 
-  // capability probe: server pipeline vs cloud mode (Vercel…) + cloud result restore
+  // capability probe: server pipeline vs cloud mode (Vercel…) + restores
   useEffect(() => {
     let alive = true
     ;(async () => {
       let m: 'server' | 'cloud' = 'server'
       let cutOK = true
       let maxMB = 200
+      let bunny = true
       try {
         const r = await fetch('/api/jobs', { cache: 'no-store' })
         const j = await r.json()
@@ -402,19 +211,45 @@ export default function Home() {
           m = 'cloud'
           cutOK = j.mode === 'cloud'
           maxMB = Number(j.cloud?.maxMB || 200)
+          bunny = j.cloud?.bunny !== false
         }
-      } catch { /* probe failed → classic server flow */ }
+      } catch { /* probe failed → cloud flow (upload→bunny→streamed cut works anywhere) */ m = 'cloud' }
       if (new URLSearchParams(window.location.search).get('mode') === 'cloud') m = 'cloud'
       if (!alive) return
       modeReadyRef.current!.resolve(m)
       setSrvMode(m)
       setCloudCutOK(cutOK)
       setCloudMaxMB(maxMB)
+      setCloudBunny(bunny)
+
+      // restore an interrupted upload session (resume with the same file)
+      try {
+        const saved = JSON.parse(localStorage.getItem('qattaas:upload') || 'null')
+        if (saved?.sessionId && saved.fileName && Number(saved.fileSize) > 0) {
+          const r = await fetch(`/api/uploads/chunked/${saved.sessionId}/status`, { cache: 'no-store' })
+          if (r.ok) {
+            const st = await r.json()
+            if (alive && st && !st.complete) {
+              setSavedUpload({ sessionId: saved.sessionId, fileName: saved.fileName, fileSize: Number(saved.fileSize) })
+              setResumeInfo({ done: (st.uploadedChunks || []).length, total: Number(st.totalChunks || 0) })
+            } else if (alive && st?.complete) {
+              // session finished uploading but never completed → offer re-pick too
+              setSavedUpload({ sessionId: saved.sessionId, fileName: saved.fileName, fileSize: Number(saved.fileSize) })
+              setResumeInfo({ done: Number(st.totalChunks || 0), total: Number(st.totalChunks || 0) })
+            } else if (alive) {
+              localStorage.removeItem('qattaas:upload')
+            }
+          } else if (alive) {
+            localStorage.removeItem('qattaas:upload')
+          }
+        }
+      } catch { /* ignore */ }
+
       if (m === 'cloud') {
         try {
           const saved = JSON.parse(localStorage.getItem('qattaas:cloud:last') || 'null')
           if (saved?.result && Date.now() - Number(saved.at || 0) < 24 * 3600_000) {
-            setCloud({ phase: 'done', sent: 0, speed: 0, ref: saved.ref, result: saved.result })
+            setCloud({ phase: 'done', ref: saved.ref, result: saved.result })
           }
         } catch { /* ignore */ }
       }
@@ -437,106 +272,20 @@ export default function Home() {
     return () => clearInterval(t)
   }, [job, refresh])
 
-  /* upload flow — shared runner (upload + kick off analyze) */
-  const runUploadAndAnalyze = useCallback(async (id: string, file: File, resumeIntervals?: [number, number][]) => {
-    upIdRef.current = id
-    upFileRef.current = file
-    upCtrl.current = { paused: false, cancelled: false }
-    upAbort.current = new AbortController()
-    setUpPaused(false)
-    speedTracker.current = { last: 0, at: Date.now() }
-    try {
-      const outcome = await uploadFile(
-        id,
-        file,
-        (sent, lanes) => {
-          const tr = speedTracker.current
-          const now = Date.now()
-          if (now - tr.at > 700 && sent > tr.last) {
-            const speed = ((sent - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
-            setUp((u) => (u ? { ...u, sent, speed, lanes } : u))
-            speedTracker.current = { last: sent, at: now }
-          } else {
-            setUp((u) => (u ? { ...u, sent, lanes } : u))
-          }
-        },
-        (msg) => setNotice(msg),
-        resumeIntervals,
-        upCtrl.current,
-        upAbort.current.signal,
-      )
-      if (outcome === 'paused') { setUpPaused(true); return }
-      const ar = await fetch(`/api/jobs/${id}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'analyze' }),
-      })
-      if (!ar.ok) throw new Error('فشل بدء التحليل')
-      setView('src')
-      setUp(null)
-      await refresh(id)
-    } catch (e: any) {
-      if (e?.name === 'CancelError') {
-        localStorage.removeItem('qattaas:job')
-        setUp(null); setNotice(null)
-      } else {
-        setJobErr(e?.message || 'حصل خطأ في الرفع')
-        setUp(null)
-      }
-    }
-  }, [refresh])
-
-  const startUpload = useCallback(async (file: File) => {
-    setJobErr(null)
-    setShowcase(false)
-    setNotice(null)
-    setUp({ file, sent: 0, speed: 0, lanes: [0, 0, 0, 0] })
-    // resume an interrupted upload of the SAME file if one exists on the server
-    let id = ''
-    let resumeIntervals: [number, number][] | undefined
-    const savedId = localStorage.getItem('qattaas:job')
-    if (savedId) {
-      try {
-        const r = await fetch(`/api/jobs/${savedId}`, { cache: 'no-store' })
-        if (r.ok) {
-          const j = await r.json()
-          if (j?.phase === 'uploading' && j.name === file.name && Number(j.size) === file.size) {
-            id = String(j.id)
-            resumeIntervals = (j.uploadIntervals || []).map(
-              (iv: any) => [Number(iv[0]), Number(iv[1])] as [number, number],
-            )
-          }
-        }
-      } catch { /* offline — fall through to fresh job */ }
-    }
-
-    if (!id) {
-      const r = await fetch('/api/jobs', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: file.name, size: file.size }),
-      })
-      if (!r.ok) {
-        if (r.status === 503) setShowcase(true)
-        setUp(null)
-        throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
-      }
-      const { id: newId } = await r.json()
-      id = String(newId)
-      localStorage.setItem('qattaas:job', id)
-    }
-    await runUploadAndAnalyze(id, file, resumeIntervals)
-  }, [runUploadAndAnalyze])
-
-  /* --------------------------------------------- cloud mode: cut + upload */
+  /* --------------------------------------------- cloud mode: streamed cut */
   /** POST /api/cloud/cut and consume its NDJSON event stream */
-  const runCloudCut = useCallback(async (ref: CloudRef) => {
+  const runCloudCut = useCallback(async (ref: AssetRef) => {
     const ac = new AbortController()
     cloudAbort.current = ac
-    setCloud((c) => ({ ...(c || { sent: 0, speed: 0 }), phase: 'cutting', ref, cut: { stage: 'prep', pct: 0, text: 'بنجهّز المعالجة…' } }))
+    setCloud({ phase: 'cutting', ref, cut: { stage: 'prep', pct: 0, text: 'بنجهّز المعالجة…' } })
     try {
       const r = await fetch('/api/cloud/cut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: ref, settings: { gapMs, thresholdDb: thr, crf } }),
+        body: JSON.stringify({
+          file: { path: ref.path, name: ref.name, size: ref.size, token: ref.token },
+          settings: { gapMs, thresholdDb: thr, crf },
+        }),
         signal: ac.signal,
       })
       if (!r.ok || !r.body) {
@@ -559,14 +308,13 @@ export default function Home() {
           let ev: any
           try { ev = JSON.parse(line) } catch { continue }
           if (ev.stage === 'download') {
-            setCloud((c) => c ? { ...c, cut: { stage: 'download', pct: ev.pct || 0, text: 'بننزّل الفيديو من السحابة…' } } : c)
+            setCloud((c) => c ? { ...c, cut: { stage: 'download', pct: ev.pct || 0, text: 'بننزّل الفيديو من التخزين السحابي…' } } : c)
           } else if (ev.stage === 'cut') {
             setCloud((c) => c ? { ...c, cut: { stage: 'cut', pct: ev.pct || 0, text: ev.text, speedX: ev.speedX, etaSec: ev.etaSec } } : c)
           } else if (ev.stage === 'done') {
             finished = true
             setCloud((c) => c ? { ...c, phase: 'done', result: ev.result } : c)
             try { localStorage.setItem('qattaas:cloud:last', JSON.stringify({ ref, result: ev.result, at: Date.now() })) } catch { /* full */ }
-            try { localStorage.removeItem('qattaas:cloud:file') } catch { /* noop */ }
           } else if (ev.stage === 'error') {
             throw new Error(ev.error || 'المعالجة فشلت')
           }
@@ -579,129 +327,90 @@ export default function Home() {
       }
     } catch (e: any) {
       if (ac.signal.aborted) { setCloud(null); return }
-      setCloud((c) => ({ ...(c || { sent: 0, speed: 0, phase: 'cutting' as const }), phase: 'error' as const, error: e?.message || 'فشل القص' }))
+      setCloud((c) => ({ ...(c || { phase: 'cutting' as const }), phase: 'error' as const, error: e?.message || 'فشل القص' }))
     }
   }, [gapMs, thr, crf])
 
-  /** upload the file DIRECTLY from the browser to GoFile's fleet, then cut */
-  const startCloudUpload = useCallback(async (file: File) => {
+  /* ------------------------------------------ the ONE upload entry point */
+  const handleFilePick = useCallback(async (file: File) => {
     setJobErr(null)
-    setNotice(null)
-    let uploadUrl = 'https://upload.gofile.io/uploadfile'
+    setRetryFile(file)
+    lastChunkErrRef.current = null
+    const m = await modeReadyRef.current!.promise
+
+    // resume an interrupted upload of the SAME file if a session exists
+    let resume: SavedUpload | null = null
+    if (savedUpload && savedUpload.fileName === file.name && savedUpload.fileSize === file.size) {
+      resume = savedUpload
+    }
+
+    let result: CompleteRes | null = null
     try {
-      const r = await fetch('/api/cloud/prepare', { cache: 'no-store' })
-      if (r.ok) {
-        const j = await r.json()
-        uploadUrl = j.upload || uploadUrl
-        if (j.maxMB) setCloudMaxMB(Number(j.maxMB))
-      }
-    } catch { /* defaults */ }
-    if (file.size > cloudMaxMB * 1024 * 1024) {
-      setCloud({
-        phase: 'error', sent: 0, speed: 0, file, retryUpload: false,
-        error: `الفيديو أكبر من ${cloudMaxMB} م.ب — ده الحد الأقصى للمسار السحابي. للفيديوهات الأكبر شغّل النسخة الكاملة مجانًا (Colab / Codespaces).`,
+      result = await upload<CompleteRes>({
+        file,
+        basePath: '/api/uploads/chunked',
+        resume,
+        onSession: (sid) => {
+          // bookmark the session → a reload can resume exactly where we stopped
+          try {
+            localStorage.setItem('qattaas:upload', JSON.stringify({
+              sessionId: sid, fileName: file.name, fileSize: file.size,
+            }))
+          } catch { /* full */ }
+        },
       })
+    } catch (e: any) {
+      if (e?.name === 'CancelError') return // silent cancel (session kept for resume)
+      setJobErr(e?.message || 'فشل الرفع')
       return
     }
-    const ac = new AbortController()
-    cloudAbort.current = ac
-    setCloud({ phase: 'uploading', file, sent: 0, speed: 0 })
-    const tr = { last: 0, at: Date.now() }
-    try {
-      const data = await new Promise<any>((resolve, reject) => {
-        const xhr = new XMLHttpRequest()
-        xhr.open('POST', uploadUrl)
-        ac.signal.addEventListener('abort', () => xhr.abort(), { once: true })
-        xhr.upload.onprogress = (e) => {
-          const now = Date.now()
-          if (now - tr.at > 600 && e.loaded > tr.last) {
-            const speed = ((e.loaded - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
-            tr.last = e.loaded; tr.at = now
-            setCloud((c) => c ? { ...c, sent: e.loaded, speed } : c)
-          } else {
-            setCloud((c) => c ? { ...c, sent: e.loaded } : c)
-          }
-        }
-        xhr.onload = () => {
-          try {
-            const j = JSON.parse(xhr.responseText)
-            if (j?.status === 'ok' && j.data) resolve(j.data)
-            else reject(new Error(`GoFile رفض الرفع (${j?.status || xhr.status})`))
-          } catch { reject(new Error('استجابة غير مقروءة من GoFile')) }
-        }
-        xhr.onerror = () => reject(new Error('الرفع على GoFile اتقطع — اتأكد من النت وجرّب تاني'))
-        xhr.onabort = () => reject(Object.assign(new Error('اتلغى الرفع'), { name: 'CancelError' }))
-        xhr.timeout = 0 // large uploads: no client-side timeout
-        const fd = new FormData()
-        fd.append('file', file, file.name)
-        xhr.send(fd)
-      })
-      const ref: CloudRef = {
-        id: String(data.id),
-        name: String(data.name || file.name),
-        size: Number(data.size || file.size),
-        ...(data.servers?.[0] ? { server: String(data.servers[0]) } : {}),
-        ...(data.guestToken ? { guestToken: String(data.guestToken) } : {}),
-        ...(data.parentFolder ? { parentFolder: String(data.parentFolder) } : {}),
-        ...(data.downloadPage ? { downloadPage: String(data.downloadPage) } : {}),
-      }
-      if (!ref.id) throw new Error('استجابة GoFile ناقصة بيانات الملف')
-      await runCloudCut(ref)
-    } catch (e: any) {
-      if (e?.name === 'CancelError') { setCloud(null); return }
-      setCloud((c) => ({
-        phase: 'error', sent: 0, speed: 0, file, retryUpload: true,
-        error: e?.message || 'فشل الرفع على GoFile',
-      }))
+
+    if (!result) {
+      // cancelled → stay quiet (session kept for resume); error → surface it
+      const err = lastChunkErrRef.current
+      if (err && err !== 'تم الإلغاء') setJobErr(err)
+      return
     }
-  }, [runCloudCut, cloudMaxMB])
 
-  useEffect(() => { startCloudRef.current = startCloudUpload }, [startCloudUpload])
+    // success → the session is complete; drop the resume bookmark
+    try { localStorage.removeItem('qattaas:upload') } catch { /* noop */ }
+    setSavedUpload(null)
+    setResumeInfo(null)
+    setRetryFile(null)
+    if (result.warning) setJobErr(result.warning)
 
-  /** route a picked file to the right flow once the mode probe has landed */
-  const handleFilePick = useCallback(async (file: File) => {
-    const m = await modeReadyRef.current!.promise
-    if (m === 'cloud') startCloudRef.current(file)
-    else startUpload(file)
-  }, [startUpload])
+    if (m === 'server' && result.server?.jobId) {
+      // classic local pipeline: analyze → timeline workbench → render
+      localStorage.setItem('qattaas:job', result.server.jobId)
+      setView('src')
+      try {
+        const ar = await fetch(`/api/jobs/${result.server.jobId}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'analyze' }),
+        })
+        if (!ar.ok) throw new Error('فشل بدء التحليل')
+        await refresh(result.server.jobId)
+      } catch (e: any) {
+        setJobErr(e?.message || 'فشل بدء التحليل')
+      }
+    } else {
+      // cloud: streamed cut from Bunny Storage
+      await runCloudCut(result.asset)
+    }
+  }, [upload, savedUpload, runCloudCut, refresh, chunkHandle])
+
+  const filePickRef = useRef(handleFilePick)
+  useEffect(() => { filePickRef.current = handleFilePick }, [handleFilePick])
 
   const cancelCloud = () => {
     cloudAbort.current?.abort()
-    try { localStorage.removeItem('qattaas:cloud:file') } catch { /* noop */ }
     setCloud(null)
   }
 
-  const pauseUpload = () => {
-    upCtrl.current.paused = true
-    upAbort.current?.abort() // in-flight chunks abort → lanes drain gracefully
-  }
-
-  const resumeUpload = async () => {
-    const file = upFileRef.current, id = upIdRef.current
-    if (!file || !id) return
-    setUpPaused(false)
-    setNotice(null)
-    let iv: [number, number][] | undefined
-    try {
-      const r = await fetch(`/api/jobs/${id}`, { cache: 'no-store' })
-      if (r.ok) {
-        const j = await r.json()
-        iv = (j?.uploadIntervals || []).map(
-          (x: any) => [Number(x[0]), Number(x[1])] as [number, number],
-        )
-      }
-    } catch { /* resume blind — server will reject bad offsets */ }
-    await runUploadAndAnalyze(id, file, iv)
-  }
-
+  /** cancel the in-flight upload (session stays on the server → resumable) */
   const cancelUpload = () => {
-    upCtrl.current.cancelled = true
-    upAbort.current?.abort()
-    if (upPaused) {
-      // no active loop (paused) → clean up directly
-      localStorage.removeItem('qattaas:job')
-      setUp(null); setNotice(null); setUpPaused(false)
-    }
+    if (chunkProgress) chunkHandle.current?.cancel()
+    else cancelSimple()
   }
 
   const startRender = useCallback(async () => {
@@ -715,32 +424,29 @@ export default function Home() {
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
-    try {
-      localStorage.removeItem('qattaas:cloud:last')
-      localStorage.removeItem('qattaas:cloud:file')
-    } catch { /* noop */ }
+    try { localStorage.removeItem('qattaas:cloud:last') } catch { /* noop */ }
     cloudAbort.current?.abort()
-    setJob(null); setUp(null); setJobErr(null); setNotice(null); setShowcase(false); setView('src'); setSkip(true); setUpPaused(false)
-    setCloud(null)
+    setJob(null); setJobErr(null); setView('src'); setSkip(true)
+    setCloud(null); setRetryFile(null)
   }
 
   /* smart input #1 — paste a video straight from the clipboard (Ctrl+V) */
   useEffect(() => {
-    if (job || up || cloud) return
+    if (job || uploading || cloud) return
     const onPaste = (e: ClipboardEvent) => {
       const f = Array.from(e.clipboardData?.files || [])[0]
       if (f && f.size > 1000) {
         e.preventDefault()
-        handleFilePick(f)
+        filePickRef.current(f)
       }
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [job, up, cloud, handleFilePick])
+  }, [job, uploading, cloud])
 
   /* smart input #2 — drop a video ANYWHERE on the page (full-screen overlay) */
   useEffect(() => {
-    if (job || up || cloud) return
+    if (job || uploading || cloud) return
     let depth = 0
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files')
     const onEnter = (e: DragEvent) => { if (hasFiles(e)) { depth++; setDragOver(true) } }
@@ -751,7 +457,7 @@ export default function Home() {
       e.preventDefault()
       depth = 0; setDragOver(false)
       const f = e.dataTransfer?.files?.[0]
-      if (f && f.size > 1000) handleFilePick(f)
+      if (f && f.size > 1000) filePickRef.current(f)
     }
     window.addEventListener('dragenter', onEnter)
     window.addEventListener('dragleave', onLeave)
@@ -763,7 +469,7 @@ export default function Home() {
       window.removeEventListener('dragover', onOver)
       window.removeEventListener('drop', onDrop)
     }
-  }, [job, up, cloud, handleFilePick])
+  }, [job, uploading, cloud])
 
   /* smart skip + playhead */
   const onTimeUpdate = useCallback(() => {
@@ -809,7 +515,7 @@ export default function Home() {
   /* ---------------------------------------------------------- render: cloud mode */
   if (srvMode === 'cloud') {
     /* ---- cloud dropzone (settings apply at cut time — one-shot flow) ---- */
-    if (!cloud) {
+    if (!cloud && !uploading) {
       return (
         <div className="h-dvh flex flex-col bg-white">
           <Header hasJob={false} onNew={newVideo} />
@@ -823,15 +529,40 @@ export default function Home() {
                 <p className="text-zinc-500 mt-2 text-lg">ارفع فيديو — هنشيل الصمت ونرجّعهولك بأقصى سرعة</p>
                 <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-orange-200 bg-orange-50 px-4 py-1.5 text-xs font-bold text-orange-700">
                   <Cloud className="w-3.5 h-3.5" />
-                  وضع السحابة — الفيديو بيترفع مباشر من متصفحك على سيرفرات GoFile
+                  وضع السحابة — رفع مقطّع + قص مباشر + حفظ دائم على Bunny
                 </div>
               </div>
 
               {!cloudCutOK && (
                 <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>الاستضافة دي بتدعم الرفع والتخزين على GoFile، لكن القص نفسه مش متفعّل هنا — للقص الكامل شغّل النسخة المجانية من Colab أو Codespaces.</span>
+                  <span>الاستضافة دي بتدعم الرفع والتخزين، لكن القص نفسه مش متفعّل هنا — للقص الكامل شغّل النسخة المجانية من Colab أو Codespaces.</span>
                 </div>
+              )}
+              {cloudCutOK && !cloudBunny && (
+                <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>التخزين السحابي (Bunny) لسه مش متظبط على السيرفر ده (BUNNY_STORAGE_PASSWORD ناقص) — الرفع ممكن يشتغل مؤقتًا بس الروابط الدائمة مش هتتحفظ.</span>
+                </div>
+              )}
+
+              {jobErr && (
+                <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center gap-2 flex-wrap">
+                  <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
+                  {retryFile && (
+                    <button onClick={() => filePickRef.current(retryFile)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 h-8 text-xs font-bold text-white hover:bg-orange-600 transition">
+                      <RefreshCw className="w-3.5 h-3.5" /> إعادة الرفع
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {savedUpload && resumeInfo && (
+                <ResumeCard saved={savedUpload} info={resumeInfo} onPick={(f) => filePickRef.current(f)} onDismiss={() => {
+                  try { localStorage.removeItem('qattaas:upload') } catch { /* noop */ }
+                  setSavedUpload(null); setResumeInfo(null)
+                }} />
               )}
 
               <label
@@ -843,11 +574,11 @@ export default function Home() {
                   e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40')
                   setDragOver(false)
                   const f = e.dataTransfer.files?.[0]
-                  if (f) handleFilePick(f)
+                  if (f) filePickRef.current(f)
                 }}
               >
                 <input type="file" accept="video/*" className="sr-only"
-                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFilePick(f) }} />
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) filePickRef.current(f) }} />
                 <div className="grid place-items-center w-14 h-14 rounded-2xl bg-orange-500/10 transition group-hover:bg-orange-500/20">
                   <Upload className="w-7 h-7 text-orange-500" />
                 </div>
@@ -868,7 +599,7 @@ export default function Home() {
               </div>
             </div>
           </main>
-          {dragOver && !cloud && (
+          {dragOver && !cloud && !uploading && (
             <div className="fixed inset-0 z-50 pointer-events-none p-4">
               <div className="h-full w-full rounded-3xl border-4 border-dashed border-orange-400 bg-orange-50/80 backdrop-blur-[2px] grid place-items-center">
                 <div className="text-center">
@@ -883,41 +614,24 @@ export default function Home() {
       )
     }
 
-    /* ---- cloud: uploading straight to GoFile ---- */
-    if (cloud.phase === 'uploading') {
-      const pct = cloud.file?.size ? Math.min(100, (cloud.sent / cloud.file.size) * 100) : 0
-      const eta = cloud.speed > 0.05 && cloud.file ? (cloud.file.size - cloud.sent) / 1024 / 1024 / cloud.speed : null
+    /* ---- cloud (and server): uploading through the chunked system ---- */
+    if (uploading) {
       return (
         <div className="h-dvh flex flex-col bg-white">
           <Header hasJob onNew={newVideo} />
           <main className="flex-1 grid place-items-center p-6">
-            <div className="w-full max-w-lg -mt-10 rounded-3xl border border-zinc-200 p-8 shadow-sm">
-              <div className="flex items-center gap-4 mb-6">
-                <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
-                  <Cloud className="w-6 h-6 text-orange-500" />
-                </div>
-                <div className="min-w-0">
-                  <div className="font-bold truncate">{cloud.file?.name}</div>
-                  <div className="text-sm text-zinc-500">{fmtMB(cloud.file?.size || 0)} — رفع مباشر على GoFile</div>
-                </div>
-              </div>
-              <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
-                <div className="h-full rounded-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
-              </div>
-              <div className="mt-3 flex justify-between text-sm text-zinc-500">
-                <span className="font-bold text-zinc-900">{pct.toFixed(0)}%</span>
-                <span>{cloud.speed > 0.05 ? `${cloud.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>
-              </div>
-              <div className="mt-2 text-xs text-zinc-400 leading-relaxed">
-                الفيديو بيتنقل من متصفحك لسيرفرات GoFile مباشرة — مش بيمر على استضافة قصّاص، فمفيش قيود رفع هنا.
-              </div>
-              <div className="mt-5 flex items-center gap-2">
-                <button onClick={cancelCloud}
-                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-500 transition hover:border-red-200 hover:text-red-600">
-                  <X className="w-4 h-4" /> إلغاء
-                </button>
-                <span className="text-[11px] text-zinc-400">{fmtMB(cloud.sent)} من {fmtMB(cloud.file?.size || 0)}</span>
-              </div>
+            <div className="w-full max-w-lg -mt-10 space-y-4">
+              <UploadPanel
+                fileName={upFileName}
+                fileSize={chunkProgress?.totalBytes ?? simpleProgress?.total ?? 0}
+                chunkProgress={chunkProgress}
+                simpleProgress={simpleProgress}
+                chunkHandle={chunkHandle.current}
+                onCancel={cancelUpload}
+              />
+              <p className="text-center text-xs text-zinc-400 leading-relaxed">
+                الفيديو بيتقسم قطع 4 م.ب وبيترفع قطعة قطعة بسرعة واستئناف تلقائي — وبعدها بيتحفظ على تخزين Bunny الدائم.
+              </p>
             </div>
           </main>
         </div>
@@ -925,7 +639,7 @@ export default function Home() {
     }
 
     /* ---- cloud: cutting (streamed stages) ---- */
-    if (cloud.phase === 'cutting') {
+    if (cloud?.phase === 'cutting') {
       const cut = cloud.cut || { stage: 'prep', pct: 0 }
       return (
         <div className="h-dvh flex flex-col bg-white">
@@ -937,16 +651,10 @@ export default function Home() {
                   <CheckCircle2 className="w-6 h-6 text-green-600" />
                 </div>
                 <div className="min-w-0">
-                  <div className="font-bold truncate">{cloud.ref?.name || cloud.file?.name}</div>
-                  <div className="text-sm text-zinc-500">اترفع على GoFile ✓ — دلوقتي بنقصّ الصمت</div>
+                  <div className="font-bold truncate">{cloud.ref?.name}</div>
+                  <div className="text-sm text-zinc-500">اترفع على التخزين السحابي ✓ — دلوقتي بنقصّ الصمت</div>
                 </div>
               </div>
-              {cloud.ref?.downloadPage && (
-                <a href={cloud.ref.downloadPage} target="_blank" rel="noopener"
-                  className="mb-5 flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 h-9 text-xs font-bold text-zinc-600 hover:border-orange-300 hover:text-orange-600 transition">
-                  <ExternalLink className="w-3.5 h-3.5" /> الفيديو الأصلي محفوظ على GoFile — اللينك شغال من دلوقتي
-                </a>
-              )}
               <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
                 <div className="h-full rounded-full bg-orange-500 transition-all duration-500" style={{ width: `${Math.max(2, cut.pct)}%` }} />
               </div>
@@ -976,7 +684,7 @@ export default function Home() {
     }
 
     /* ---- cloud: done (results) ---- */
-    if (cloud.phase === 'done') {
+    if (cloud?.phase === 'done') {
       const r = cloud.result
       const plan = r?.plan
       const outDur = r?.output?.durationMs ?? plan?.keptMs
@@ -1001,18 +709,18 @@ export default function Home() {
                 <a href={r.resultUrl} target="_blank" rel="noopener"
                   className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5">
                   <Download className="w-5 h-5" />
-                  افتح النتيجة على GoFile
+                  نزّل النتيجة (رابط دائم)
                 </a>
               ) : (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                  القص خلص بس حفظ النتيجة على GoFile مش متاح من هنا دلوقتي — جرّب تاني أو استخدم النسخة الكاملة.
+                  القص خلص بس حفظ النتيجة على التخزين السحابي حصل فيه مشكلة — جرّب تقصّه تاني أو استخدم النسخة الكاملة.
                 </div>
               )}
 
               {r?.original && (
                 <a href={r.original} target="_blank" rel="noopener"
                   className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm">
-                  <ExternalLink className="w-4 h-4" /> الفيديو الأصلي على GoFile
+                  <ExternalLink className="w-4 h-4" /> الفيديو الأصلي على التخزين
                 </a>
               )}
 
@@ -1047,7 +755,7 @@ export default function Home() {
               )}
 
               <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
-                الملفات على GoFile — اللينك بيعيش مع آخر تحميل منه (GoFile بيمسح الملفات غير النشطة تلقائيًا).
+                الملفات محفوظة على Bunny Storage — النتيجة بتترجع في نفس مكان الأصل، والروابط الموقّعة بتفتح لمدة أسبوع من وقت القص.
               </p>
 
               <button onClick={newVideo}
@@ -1061,59 +769,55 @@ export default function Home() {
     }
 
     /* ---- cloud: error ---- */
-    return (
-      <div className="h-dvh flex flex-col bg-white">
-        <Header hasJob onNew={newVideo} />
-        <main className="flex-1 grid place-items-center p-6">
-          <div className="w-full max-w-lg -mt-10 rounded-3xl border border-red-200 bg-red-50/50 p-8 shadow-sm">
-            <div className="flex items-center gap-4 mb-5">
-              <div className="grid place-items-center w-12 h-12 rounded-2xl bg-red-100">
-                <AlertTriangle className="w-6 h-6 text-red-600" />
+    if (cloud?.phase === 'error') {
+      return (
+        <div className="h-dvh flex flex-col bg-white">
+          <Header hasJob onNew={newVideo} />
+          <main className="flex-1 grid place-items-center p-6">
+            <div className="w-full max-w-lg -mt-10 rounded-3xl border border-red-200 bg-red-50/50 p-8 shadow-sm">
+              <div className="flex items-center gap-4 mb-5">
+                <div className="grid place-items-center w-12 h-12 rounded-2xl bg-red-100">
+                  <AlertTriangle className="w-6 h-6 text-red-600" />
+                </div>
+                <div className="font-black text-lg">حصل خطأ</div>
               </div>
-              <div className="font-black text-lg">حصل خطأ</div>
-            </div>
-            <p className="text-sm text-red-700 leading-relaxed">{cloud.error || 'خطأ غير معروف'}</p>
-            <div className="mt-5 flex flex-wrap items-center gap-2">
-              {cloud.retryUpload && cloud.file && (
-                <button onClick={() => startCloudUpload(cloud.file!)}
-                  className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
-                  <RefreshCw className="w-4 h-4" /> إعادة الرفع
+              <p className="text-sm text-red-700 leading-relaxed">{cloud.error || 'خطأ غير معروف'}</p>
+              <div className="mt-5 flex flex-wrap items-center gap-2">
+                {cloud.ref && (
+                  <button onClick={() => runCloudCut(cloud.ref!)}
+                    className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
+                    <RefreshCw className="w-4 h-4" /> إعادة محاولة القص
+                  </button>
+                )}
+                <button onClick={newVideo}
+                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-700 transition hover:border-orange-300">
+                  فيديو جديد
                 </button>
-              )}
-              {!cloud.retryUpload && cloud.ref && (
-                <button onClick={() => runCloudCut(cloud.ref!)}
-                  className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
-                  <RefreshCw className="w-4 h-4" /> إعادة محاولة القص
-                </button>
-              )}
-              <button onClick={newVideo}
-                className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-700 transition hover:border-orange-300">
-                فيديو جديد
-              </button>
-            </div>
-            <div className="mt-5 pt-4 border-t border-red-100">
-              <p className="text-xs text-red-600 leading-relaxed mb-2">الفيلم كبير أو الاستضافة بطيئة؟ النسخة الكاملة المجانية بتاخد أي حجم:</p>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <a href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
-                  target="_blank" rel="noopener"
-                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-3.5 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-orange-600">
-                  <Rocket className="w-3.5 h-3.5" /> Google Colab
-                </a>
-                <a href="https://codespaces.new/mrmoneimofficial-del/autocut"
-                  target="_blank" rel="noopener"
-                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-3.5 py-2 text-xs font-bold text-zinc-700 shadow-sm transition hover:border-orange-300">
-                  <Github className="w-3.5 h-3.5" /> GitHub Codespaces
-                </a>
+              </div>
+              <div className="mt-5 pt-4 border-t border-red-100">
+                <p className="text-xs text-red-600 leading-relaxed mb-2">الفيلم كبير أو الاستضافة بطيئة؟ النسخة الكاملة المجانية بتاخد أي حجم:</p>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <a href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
+                    target="_blank" rel="noopener"
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-3.5 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-orange-600">
+                    <Rocket className="w-3.5 h-3.5" /> Google Colab
+                  </a>
+                  <a href="https://codespaces.new/mrmoneimofficial-del/autocut"
+                    target="_blank" rel="noopener"
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-3.5 py-2 text-xs font-bold text-zinc-700 shadow-sm transition hover:border-orange-300">
+                    <Github className="w-3.5 h-3.5" /> GitHub Codespaces
+                  </a>
+                </div>
               </div>
             </div>
-          </div>
-        </main>
-      </div>
-    )
+          </main>
+        </div>
+      )
+    }
   }
 
-  /* ---------------------------------------------------------- render: upload screen */
-  if (!job && !up) {
+  /* ------------------------------------------------- render: server mode landing */
+  if (!job && !uploading) {
     return (
       <div className="h-dvh flex flex-col bg-white">
         <Header hasJob={false} onNew={newVideo} />
@@ -1128,39 +832,22 @@ export default function Home() {
             </div>
 
             {jobErr && (
-              <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                <div className="flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
-                </div>
-                {showcase && (
-                  <div className="mt-3 flex flex-col gap-3">
-                    <div className="flex flex-col gap-2 sm:flex-row">
-                      <a
-                        href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
-                        target="_blank"
-                        rel="noopener"
-                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600"
-                      >
-                        <Rocket className="w-4 h-4" />
-                        شغّل نسخة كاملة مجانًا على Google Colab
-                      </a>
-                      <a
-                        href="https://codespaces.new/mrmoneimofficial-del/autocut"
-                        target="_blank"
-                        rel="noopener"
-                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-red-300 bg-white px-4 py-2.5 text-sm font-bold text-red-700 shadow-sm transition hover:bg-red-50"
-                      >
-                        <Github className="w-4 h-4" />
-                        أو على GitHub Codespaces
-                      </a>
-                    </div>
-                    <span className="text-xs leading-5 text-red-600">
-                      النسخة دي للعرض بس (استضافة بدون تخزين). الروابط دي بتفتحلك سيرفر شغال مجاني في دقيقة —
-                      ترفع الفيديو وتقصّه عادي، وفي آخره لينك دائم للنتيجة.
-                    </span>
-                  </div>
+              <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center gap-2 flex-wrap">
+                <AlertTriangle className="w-4 h-4 shrink-0" /> {jobErr}
+                {retryFile && (
+                  <button onClick={() => filePickRef.current(retryFile)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 h-8 text-xs font-bold text-white hover:bg-orange-600 transition">
+                    <RefreshCw className="w-3.5 h-3.5" /> إعادة الرفع
+                  </button>
                 )}
               </div>
+            )}
+
+            {savedUpload && resumeInfo && (
+              <ResumeCard saved={savedUpload} info={resumeInfo} onPick={(f) => filePickRef.current(f)} onDismiss={() => {
+                try { localStorage.removeItem('qattaas:upload') } catch { /* noop */ }
+                setSavedUpload(null); setResumeInfo(null)
+              }} />
             )}
 
             <label
@@ -1172,11 +859,11 @@ export default function Home() {
                 e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40')
                 setDragOver(false)
                 const f = e.dataTransfer.files?.[0]
-                if (f) handleFilePick(f)
+                if (f) filePickRef.current(f)
               }}
             >
               <input type="file" accept="video/*" className="sr-only"
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFilePick(f) }} />
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) filePickRef.current(f) }} />
               <div className="grid place-items-center w-14 h-14 rounded-2xl bg-orange-500/10 transition group-hover:bg-orange-500/20">
                 <Upload className="w-7 h-7 text-orange-500" />
               </div>
@@ -1194,7 +881,7 @@ export default function Home() {
           </div>
         </main>
         {/* full-screen drop overlay — drop anywhere, not just the box */}
-        {dragOver && !job && !up && (
+        {dragOver && !job && !uploading && (
           <div className="fixed inset-0 z-50 pointer-events-none p-4">
             <div className="h-full w-full rounded-3xl border-4 border-dashed border-orange-400 bg-orange-50/80 backdrop-blur-[2px] grid place-items-center">
               <div className="text-center">
@@ -1209,105 +896,24 @@ export default function Home() {
     )
   }
 
-  /* ------------------------------------- render: interrupted upload (resume) */
-  if (job && !up && job.phase === 'uploading') {
-    const pct = job.size ? Math.min(100, ((job.uploaded || 0) / job.size) * 100) : 0
+  /* ------------------------------------------- render: upload progress (server) */
+  if (!job && uploading) {
     return (
       <div className="h-dvh flex flex-col bg-white">
         <Header hasJob onNew={newVideo} />
         <main className="flex-1 grid place-items-center p-6">
-          <div className="w-full max-w-lg -mt-10 rounded-3xl border border-orange-200 bg-orange-50/50 p-8 shadow-sm">
-            <div className="flex items-center gap-4 mb-5">
-              <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
-                <RefreshCw className="w-6 h-6 text-orange-500" />
-              </div>
-              <div className="min-w-0">
-                <div className="font-bold truncate">{job.name}</div>
-                <div className="text-sm text-zinc-500">{fmtMB(job.uploaded || 0)} من {fmtMB(job.size)} اترفعوا خلاص</div>
-              </div>
-            </div>
-            <div className="h-3 rounded-full bg-orange-100 overflow-hidden mb-5">
-              <div className="h-full rounded-full bg-orange-500" style={{ width: `${pct}%` }} />
-            </div>
-            <p className="text-sm text-zinc-600 leading-relaxed mb-4">
-              الرفع اتقطع (قفلت الصفحة أو النت وقع) — <b>اختار نفس الملف تاني</b> وهنكمّل من نفس النقطة بالظبط، من غير ما نبدأ من الأول.
+          <div className="w-full max-w-lg -mt-10 space-y-4">
+            <UploadPanel
+              fileName={upFileName}
+              fileSize={chunkProgress?.totalBytes ?? simpleProgress?.total ?? 0}
+              chunkProgress={chunkProgress}
+              simpleProgress={simpleProgress}
+              chunkHandle={chunkHandle.current}
+              onCancel={cancelUpload}
+            />
+            <p className="text-center text-xs text-zinc-400 leading-relaxed">
+              الفيديو بيتقسم قطع 4 م.ب وبيترفع قطعة قطعة بسرعة واستئناف تلقائي — وبعدها بيبدأ التحليل فورًا.
             </p>
-            <label className="group flex flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-orange-300 bg-white px-6 py-8 cursor-pointer transition hover:border-orange-400 hover:bg-orange-50/40">
-              <input type="file" accept="video/*" className="sr-only"
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) startUpload(f) }} />
-              <Upload className="w-6 h-6 text-orange-500" />
-              <span className="font-bold">اختار نفس الملف — «{job.name}»</span>
-              <span className="text-xs text-zinc-500">لازم نفس الملف بالظبط (الاسم والحجم) عشان نتأكد إنه هو هو</span>
-            </label>
-          </div>
-        </main>
-      </div>
-    )
-  }
-
-  /* ---------------------------------------------------------- render: upload progress */
-  if (!job && up) {
-    const pct = up.file.size ? Math.min(100, (up.sent / up.file.size) * 100) : 0
-    const eta = up.speed > 0.05 ? (up.file.size - up.sent) / 1024 / 1024 / up.speed : null
-    return (
-      <div className="h-dvh flex flex-col bg-white">
-        <Header hasJob onNew={newVideo} />
-        <main className="flex-1 grid place-items-center p-6">
-          <div className="w-full max-w-lg -mt-10 rounded-3xl border border-zinc-200 p-8 shadow-sm">
-            <div className="flex items-center gap-4 mb-6">
-              <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
-                <Film className="w-6 h-6 text-orange-500" />
-              </div>
-              <div className="min-w-0">
-                <div className="font-bold truncate">{up.file.name}</div>
-                <div className="text-sm text-zinc-500">{fmtMB(up.file.size)}</div>
-              </div>
-            </div>
-            <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
-              <div className={`h-full rounded-full transition-all duration-300 ${upPaused ? 'bg-zinc-400' : 'bg-orange-500'}`} style={{ width: `${pct}%` }} />
-            </div>
-            {/* live lanes — the 4 parallel streams eating the file */}
-            <div className="mt-2.5 flex items-center gap-1.5" dir="ltr" title="٤ مسارات رفع متوازية">
-              {(up.lanes || []).map((lb, i) => (
-                <div key={i} className="h-1.5 flex-1 rounded-full bg-zinc-100 overflow-hidden">
-                  <div
-                    className={`h-full rounded-full ${upPaused ? 'bg-zinc-400' : 'bg-orange-300'}`}
-                    style={{ width: `${Math.min(100, (lb / (8 * 1024 * 1024)) * 100)}%`, transition: 'width 200ms ease' }}
-                  />
-                </div>
-              ))}
-              <span className="text-[10px] font-bold text-zinc-400 shrink-0">4×⇅</span>
-            </div>
-            {notice && (
-              <div className="mt-3 flex items-center gap-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 text-xs font-bold text-orange-700">
-                <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin" style={{ animationDuration: '3s' }} />
-                {notice}
-              </div>
-            )}
-            <div className="mt-3 flex justify-between text-sm text-zinc-500">
-              <span className="font-bold text-zinc-900">{upPaused ? 'متوقف مؤقتًا' : `${pct.toFixed(0)}%`}</span>
-              <span>{upPaused ? 'اضغط استئناف لتكميل من نفس النقطة' : up.speed > 0.05 ? `${up.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>
-            </div>
-            {(upPaused || up.sent < up.file.size) && (
-              <div className="mt-5 flex items-center gap-2">
-                {!upPaused ? (
-                  <button onClick={pauseUpload}
-                    className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-700 transition hover:border-orange-300 hover:text-orange-600">
-                    <Pause className="w-4 h-4" /> إيقاف مؤقت
-                  </button>
-                ) : (
-                  <button onClick={resumeUpload}
-                    className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
-                    <Play className="w-4 h-4" /> استئناف
-                  </button>
-                )}
-                <button onClick={cancelUpload}
-                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-500 transition hover:border-red-200 hover:text-red-600">
-                  <X className="w-4 h-4" /> إلغاء
-                </button>
-                <span className="text-[11px] text-zinc-400">{fmtMB(up.sent)} من {fmtMB(up.file.size)}</span>
-              </div>
-            )}
           </div>
         </main>
       </div>
@@ -1357,7 +963,7 @@ export default function Home() {
               {phase === 'mirroring' && (
                 <span className="inline-flex items-center gap-2 rounded-xl bg-orange-50 border border-orange-200 px-3 h-9 text-sm font-bold text-orange-700">
                   <CloudUpload className="w-4 h-4" />
-                  نحفظ نسخة خارجية…
+                  بنحفظ النتيجة على التخزين…
                 </span>
               )}
             </div>
@@ -1509,14 +1115,14 @@ export default function Home() {
               </section>
             )}
 
-            {/* action: external mirror (non-blocking bonus) */}
+            {/* action: storage upload (non-blocking bonus) */}
             {phase === 'mirroring' && (
               <section className="rounded-2xl border border-orange-200 bg-orange-50/50 p-4 space-y-2">
                 <div className="flex items-center gap-2 text-sm font-bold text-orange-700">
                   <CloudUpload className="w-4 h-4 shrink-0" />
-                  نحفظ نسخة خارجية من النتيجة…
+                  بنحفظ النتيجة على التخزين السحابي…
                 </div>
-                <p className="text-xs text-zinc-500 leading-relaxed">دي مش بتأخر تحميلك — النتيجة جاهزة ونزّلها من الزر البرتقالي تحت، واللينك الخارجي هيظهر هنا خلال لحظات ويعيش حتى بعد ما السيرفر يقفل.</p>
+                <p className="text-xs text-zinc-500 leading-relaxed">دي مش بتأخر تحميلك — النتيجة جاهزة ونزّلها من الزر البرتقالي تحت، والرابط الدائم هيظهر هنا خلال لحظات ويعيش حتى بعد ما السيرفر يقفل.</p>
               </section>
             )}
 
@@ -1547,26 +1153,26 @@ export default function Home() {
                 >
                   <Eye className="w-4 h-4" /> معاينة النتيجة
                 </button>
-                {(job!.gofile?.url || job!.bunny?.url) && (
+                {job!.resultUrl && (
                   <a
-                    href={job!.bunny?.url || job!.gofile!.url}
+                    href={job!.resultUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm"
                   >
                     <ExternalLink className="w-4 h-4" />
-                    {job!.bunny ? 'المشاهدة على Bunny Stream (دائم)' : 'نسخة خارجية دائمة (GoFile)'}
+                    رابط دائم من Bunny Storage
                   </a>
                 )}
-                {job!.bunny?.mp4 && (
+                {job!.originalUrl && (
                   <a
-                    href={job!.bunny.mp4}
+                    href={job!.originalUrl}
                     target="_blank"
-                    rel="noopener"
+                    rel="noopener noreferrer"
                     className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm"
                   >
                     <Film className="w-4 h-4" />
-                    رابط MP4 مباشر من الـ CDN
+                    الأصل على التخزين السحابي
                   </a>
                 )}
                 <div className="flex items-center justify-center gap-4 text-xs text-zinc-400 tabular-nums">
@@ -1574,14 +1180,13 @@ export default function Home() {
                   <span className="flex items-center gap-1"><HardDrive className="w-3 h-3" /> {fmtMB(job!.output.size)}</span>
                   <span className="flex items-center gap-1"><CheckCircle2 className="w-3 h-3 text-orange-500" /> تزامن 100%</span>
                 </div>
-                {job!.gofile?.url && (
+                {job!.resultUrl ? (
                   <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
-                    اللينك الخارجي من GoFile — بيعيش مع آخر تحميل منه (GoFile بيمسح الملفات غير النشطة تلقائيًا).
+                    اللينك الدائم من Bunny Storage — النتيجة محفوظة جنب الفيديو الأصلي على نفس التخزين.
                   </p>
-                )}
-                {job!.bunny?.url && (
+                ) : (
                   <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
-                    اللينك من Bunny Stream وبيعيش للأبد — لو لسه مش شغال، انتظر دقيقة لحد ما الترميز يخلص. (لينك الـ MP4 افتحه بالضغط من هنا مباشرةً).
+                    التخزين السحابي مش متظبط على السيرفر ده — النتيجة محفوظة محليًا ونزّلها من الزر البرتقالي.
                   </p>
                 )}
               </div>
@@ -1594,6 +1199,80 @@ export default function Home() {
 }
 
 /* -------------------------------------------------------------- bits */
+
+/** interrupted-upload resume card — the attached system's resume mechanism surfaced in the UI */
+function ResumeCard({ saved, info, onPick, onDismiss }: {
+  saved: SavedUpload
+  info: { done: number; total: number }
+  onPick: (f: File) => void
+  onDismiss: () => void
+}) {
+  const pct = info.total > 0 ? Math.round((info.done / info.total) * 100) : 0
+  return (
+    <div className="mb-4 rounded-2xl border border-orange-200 bg-orange-50/50 p-5">
+      <div className="flex items-center gap-3 mb-3">
+        <div className="grid place-items-center w-10 h-10 rounded-2xl bg-orange-500/10 shrink-0">
+          <RefreshCw className="w-5 h-5 text-orange-500" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="font-bold truncate text-sm">{saved.fileName}</div>
+          <div className="text-xs text-zinc-500">
+            {info.done >= info.total
+              ? 'الرفع خلص خلاص — اختار نفس الملف وهنكمّل فورًا'
+              : `${fmtBytesCard(info.done * 4 * 1024 * 1024)} من ${fmtBytesCard(saved.fileSize)} اترفعوا خلاص`}
+          </div>
+        </div>
+        <button onClick={onDismiss} title="تجاهل"
+          className="w-8 h-8 rounded-md hover:bg-orange-100 flex items-center justify-center text-zinc-400 hover:text-zinc-700 transition shrink-0">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+      <div className="h-2 rounded-full bg-orange-100 overflow-hidden mb-3">
+        <div className="h-full rounded-full bg-orange-500" style={{ width: `${Math.min(100, pct)}%` }} />
+      </div>
+      <label className="group flex flex-col items-center gap-1.5 rounded-xl border-2 border-dashed border-orange-300 bg-white px-4 py-5 cursor-pointer transition hover:border-orange-400 hover:bg-orange-50/40">
+        <input type="file" accept="video/*" className="sr-only"
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) onPick(f) }} />
+        <Upload className="w-5 h-5 text-orange-500" />
+        <span className="font-bold text-sm">اختار نفس الملف — «{saved.fileName}»</span>
+        <span className="text-[11px] text-zinc-500">لازم نفس الملف بالظبط (الاسم والحجم) عشان نتأكد إنه هو هو</span>
+      </label>
+    </div>
+  )
+}
+
+/** upload screen frame — header + the shared UploadProgressCard (both modes) */
+function UploadPanel({ fileName, fileSize, chunkProgress, simpleProgress, chunkHandle, onCancel }: {
+  fileName: string
+  fileSize: number
+  chunkProgress: ChunkProgress | null
+  simpleProgress: { loaded: number; total: number; percent: number } | null
+  chunkHandle: ChunkedUploadHandle | null
+  onCancel: () => void
+}) {
+  return (
+    <div className="rounded-3xl border border-zinc-200 p-8 shadow-sm">
+      <div className="flex items-center gap-4 mb-6">
+        <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
+          <Film className="w-6 h-6 text-orange-500" />
+        </div>
+        <div className="min-w-0">
+          <div className="font-bold truncate">{fileName || '…'}</div>
+          <div className="text-sm text-zinc-500">{fmtBytesCard(fileSize)}</div>
+        </div>
+      </div>
+      <UploadProgressCard
+        fileName={fileName || 'فيديو'}
+        chunkProgress={chunkProgress}
+        simpleProgress={simpleProgress}
+        chunkHandle={chunkHandle}
+        onCancel={onCancel}
+        mergingLabel="بنجهّز الملف على السيرفر…"
+      />
+    </div>
+  )
+}
+
 function Header({ hasJob, onNew }: { hasJob: boolean; onNew: () => void }) {
   return (
     <header className="h-14 shrink-0 border-b border-zinc-200 bg-white flex items-center justify-between px-4 sm:px-6">

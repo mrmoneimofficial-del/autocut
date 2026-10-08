@@ -14,10 +14,10 @@
 - 🎯 **دقة فريم-بفريم** — نقاط القص محاذاة على شبكة فريمات الفيديو، والصوت مقصوص بالعينة = تزامن A/V رياضي 100%
 - 🧠 **بريفيو ذكي** — شاهد الفيديو مع تخطي الصمت تلقائيًا قبل الرندر، وتايم لاين تفاعلي (الكلام رمادي / الصمت برتقالي)
 - 🎛️ **3 إعدادات فقط** — طول الفجوة المتبقية، حساسية الكشف، الجودة
-- 📤 **رفع مقطّع موثوق** — قطع 8MB مع تتبع التقدم والسرعة وETA، واستكمال تلقائي بعد الانقطاع
-- ☁️ **وضع السحابة للاستضافات بدون تخزين (زي Vercel)** — المتصفح بيترفع مباشر على سيرفرات GoFile، والقص بيحصل في طلب واحد مبثوث حيًا بنفس محرك FFmpeg — شوف «وضع السحابة» تحت
+- 📤 **رفع مقطّع موثوق (نظام مستر منعم)** — الفيديو بيتقسم قطع 4MB (تحت حد Vercel 4.5MB) وبيترفع قطعة قطعة: تقدم حقيقي بالنسبة + سرعة + وقت متبقٍ، إيقاف مؤقت/استئناف/إلغاء، إعادة محاولة تلقائية (5 محاولات لكل قطعة)، checksum لكل قطعة، واستئناف بعد قفلة الصفحة من نفس القطعة بالظبط — والملف بيهبط على **Bunny Storage** بشكل دائم
+- ☁️ **وضع السحابة للاستضافات بدون تخزين (زي Vercel)** — نفس نظام الرفع شغال فوق أي استضافة (القطع تحت 4.5MB)، والقص بيحصل في طلب واحد مبثوث حيًا بنفس محرك FFmpeg — شوف «وضع السحابة» تحت
 - 🇸🇦 **عربي بالكامل** — RTL بخط Cairo، تصميم أبيض/برتقالي نظيف
-- ☁️ **نسخة خارجية تلقائية** — بعد كل رندر ناجح، النتيجة بتترفع تلقائيًا على **Bunny Stream** (لو مُفعّل — لينك دائم ببيلير جاهز) أو **GoFile** كاحتياطي، واللينك بيعيش حتى بعد ما السيرفر يقفل. الإعداد: `BUNNY_STREAM_LIBRARY_ID` + `BUNNY_STREAM_API_KEY` (و`BUNNY_STREAM_API_KEY_ALT` لمفتاح احتياطي)، و`BUNNY_CDN_HOST` اختياري لتفعيل رابط MP4 مباشر من الـ CDN (زونات Stream بتمنع الفتح المباشر بدون referer — اللينك يفتح بالضغط من الواجهة، والبيلير شغال في كل حتة)، وتعطيل الرفع الخارجي: `GOFILE_MIRROR=0` مع إزالة متغيرات Bunny. في ناسي رقم المكتبة؟ `bun scripts/find-bunny-library.mjs --from N --to M` بيلقية بمفتاحك
+- 🔐 **توصيل موقّع** — كل روابط التنزيل (الأصل + النتائج) بتتوّق HMAC-SHA256 وبتنتهي تلقائيًا — المسارات الحقيقية مش بتظهر في الروابط أبدًا، والبث بيدعم Range (تقديم/تأخير)
 
 ## 🔄 سير العمل
 
@@ -34,7 +34,7 @@
 |--------|---------|
 | الواجهة | Next.js 16 · React 19 · Tailwind CSS 4 |
 | المحرّك | FFmpeg 7 — `silencedetect` + `select` + concat demuxer |
-| الـ API | 3 مسارات فقط: إنشاء / حالة / رفع ملف |
+| الـ API | نظام رفع مقطّع (init/chunk/status/complete) + بث موقّع + مسارات المهام |
 | التخزين | ملف JSON لكل job — بدون قاعدة بيانات |
 
 **المحرك في ملف واحد:** [`scripts/pipeline-runner.mjs`](scripts/pipeline-runner.mjs) — مسح ← خطة قص على شبكة الفريمات ← بث الصوت (فك ترميز ← قص بالبايت ← AAC بدون ملفات وسيطة) ← N أجزاء فيديو متوازية ← دمج + تحقق من المدة. كل استدعاء ffmpeg يستخدم `-nostdin` والعملية تعمل detached.
@@ -51,18 +51,29 @@ bun run dev     # http://localhost:3000
 
 ## ⚡ وضع السحابة — Vercel نفسها بقت ترفع وتقص ☁️
 
-أي نشر على استضافة serverless (قراءة فقط + حد 4.5MB لجسم الطلب) بيدخل **وضع السحابة** تلقائيًا من غير أي إعداد:
+أي نشر على استضافة serverless (قراءة فقط + حد 4.5MB لجسم الطلب) بيدخل **وضع السحابة** تلقائيًا. الرفع نفسه شغال فوق أي استضافة لأنه **نظام مستر منعم المقطّع**: المتصفح بيفتح جلسة رفع، بيبعت الفيديو قطع 4MB واحدة واحدة (كل قطعة طلب مستقل تحت الحد)، السيرفر بيدمجهم على `/tmp`، وبيرفع الأصل على **Bunny Storage**:
 
-1. **المتصفح بيترفع الفيديو مباشر على أسطول GoFile** (`upload.gofile.io` — الـ API بتاعتهم مدعوم رسميًا للمتصفحات) — الاستضافة مش بتشوف الملف خالص، فمفيش حدود رفع
-2. **القص بيحصل جوه طلب واحد**: السيرفر بينزّل الأصل من GoFile على `/tmp` مؤقت، بيشغّل نفس محرك القص بالظبط (ثنائيات `ffmpeg-static`/`ffprobe-static` متدمجة مع الدالة عبر `outputFileTracingIncludes`)، وبيرفع النتيجة على نفس مجلد GoFile — النتيجة والأصل في صفحة تنزيل واحدة
+1. **الرفع مقطّع من المتصفح للسيرفر** — تقدم حقيقي + سرعة + ETA + إيقاف مؤقت + إلغاء + retry تلقائي، والقطع اللي هبطت بتتحسب من السيرفر (endpoint الـ status) فالاستئناف بعد أي انقطاع أو قفلة صفحة بيكمل من نفس القطعة
+2. **القص بيحصل جوه طلب واحد مبثوث**: السيرفر بيجيب الأصل (نسخة دافية من `/tmp` لو موجودة، وإلا بينزّله من Bunny)، بيشغّل نفس محرك القص بالظبط (ثنائيات `ffmpeg-static`/`ffprobe-static` متدمجة مع الدالة عبر `outputFileTracingIncludes`)، وبيرفع النتيجة على **نفس مجلد الجلسة** على Bunny — النتيجة والأصل جنب بعض دايمًا
 3. **الأحداث بتبث للمتصفح حيًا** (NDJSON): تنزيل ← مسح ← ترميز بسرعة وETA ← رفع النتيجة
-4. **إعادة قص بإعدادات تانية من غير إعادة رفع** — الفيديو خلاص محفوظ على GoFile
+4. **إعادة قص بإعدادات تانية من غير إعادة رفع** — الأصل خلاص محفوظ على Bunny
 
-الحدود: ~`CLOUD_MAX_MB` (200 افتراضيًا) و300 ثانية للطلب (أقصى خطة Hobby مع Fluid Compute).
+الحدود: `CLOUD_MAX_MB` (200 افترائيًا) و300 ثانية للطلب (أقصى خطة Hobby مع Fluid Compute).
 
-متغيرات اختيارية: `CLOUD_MAX_MB` (حد الحجم)، `GOFILE_WT_SALT` (ملح توكن الموقع — gofile بيدوّره كل فترة؛ الافتراضي `12af056dacea0b` زي ما هو في wt.obf.js حاليًا)، `GOFILE_USER_AGENT` / `GOFILE_LANGUAGE` (لازم يطابقوا حساب التوكن)، و`GOFILE_API` / `GOFILE_UPLOAD_BASE` / `GOFILE_STORE_BASE` للاختبار الذاتي.
+### 🔑 متغيرات البيئة المطلوبة (الوضع السحابي)
 
-**فحص ذاتي:** افتح `/api/cloud/diag` على أي نشر — بيقولك بالظبط إيه اللي شغال من شبكة الاستضافة دي (gofile بيحجب IPات مراكز البيانات على الحافة أحيانًا — لو التنزيل محجوب، الرفع من المتصفح بيفضل شغال والقص بيترشّح لكولاب/كودسبيسز).
+```
+BUNNY_STORAGE_ZONE=<اسم زون التخزين>          # مثال: qattaas
+BUNNY_STORAGE_PASSWORD=<مفتاح الكتابة (AccessKey)>
+BUNNY_STORAGE_READ_PASSWORD=<مفتاح القراءة>   # اختياري — بيقع على مفتاح الكتابة
+ADMIN_SESSION_SECRET=<سر قوي>                 # توقيع روابط التنزيل (HMAC-SHA256)
+```
+
+متغيرات اختيارية: `CLOUD_MAX_MB` (حد الحجم)، `BUNNY_STORAGE_HOST` (تبديل نقطة النهاية للاختبار الذاتي/الاستضافة الخاصة)، `QATTAAS_TOKEN_TTL_MS` (عمر روابط التنزيل — 7 أيام افترائيًا).
+
+> 🧪 **للاختبار المحلي بدون حساب Bunny:** الريبو فيه `mini-services/bunny-mock` — محاكي كامل لـ API تخزين Bunny على بورت 3041 — وجّه `BUNNY_STORAGE_HOST=http://localhost:3041` واختبر السلسلة كلها.
+
+**فحص ذاتي:** افتح `/api/cloud/diag` على أي نشر — بيقولك بالظبط إيه اللي شغال: `/tmp` قابل للكتابة؟ Bunny متظبط وقابل للوصول والكتابة من شبكة الاستضافة؟ ffmpeg شغال؟
 
 ## ☁️ النشر المجاني غير المحلي — الخيارات الحقيقية (أكتوبر 2026)
 
@@ -84,7 +95,7 @@ bun run dev     # http://localhost:3000
 
 - الريبو فيه `.devcontainer` جاهز: أول تشغيل بيبني نفس صورة الإنتاج بالظبط (UI + API + ffmpeg) ويشغّل السيرفر تلقائيًا على بورت 7860
 - من تبويب **Ports** بالأسفل: كليك يمين على 7860 ← **Port Visibility ← Public** ← انسخ اللينك وشاركه مع أي حد
-- (اختياري) لتفعيل روابط Bunny الدايمة: **GitHub ← Settings ← Codespaces ← Secrets** — ضيف `BUNNY_STREAM_LIBRARY_ID` و `BUNNY_STREAM_API_KEY` و `BUNNY_CDN_HOST` وحدد الريبو ده
+- (اختياري) لتفعيل الحفظ الدائم على Bunny: **GitHub ← Settings ← Codespaces ← Secrets** — ضيف `BUNNY_STORAGE_ZONE` و `BUNNY_STORAGE_PASSWORD` و `ADMIN_SESSION_SECRET` وحدد الريبو ده
 - الكودسبيس بينام بعد 30 دقيقة خمول (اللينك بيرجع أول ما تشغّله تاني من github.com/codespaces) — مناسب للاستخدام عند الحاجة
 
 ### ج) Modal — أقوى حل مجاني دائم 🏆 (الأفضل لحل عام ثابت)
@@ -115,7 +126,7 @@ Blazing-fast video silence cutter with a minimal Arabic RTL UI (white/orange, Ca
 
 - **Engine**: single-file FFmpeg pipeline — `silencedetect` scan → frame-grid-aligned cut plan → streaming sample-accurate audio slicing → N≤8 parallel `libx264 ultrafast` video chunks → concat + single-step mux with duration verification.
 - **Stack**: Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · zero-DB (JSON job files).
-- **UI**: upload with chunked XHR → smart preview (auto-skip silence + interactive timeline) → 3 essential settings → parallel render with live progress → download + automatic external mirror of the result (Bunny Stream if `BUNNY_STREAM_*` env is set, else GoFile; survives ephemeral hosts). Optional `BUNNY_CDN_HOST` adds a direct CDN MP4 link (Stream zones block referer-less requests — click it from the UI; the embed player link works everywhere).
+- **UI**: chunked upload (4MB, the مستر منعم system: real %, speed, ETA, pause/resume/cancel, auto-retry, resume-after-reload) → smart preview (auto-skip silence + interactive timeline) → 3 essential settings → parallel render with live progress → download + permanent Bunny Storage link (signed HMAC tokens, Range-capable streaming) for both the original and the result.
 
 ```bash
 bun install && bun run dev   # requires ffmpeg on the host
@@ -123,7 +134,7 @@ bun install && bun run dev   # requires ffmpeg on the host
 
 ## 🐳 Full deployment (UI + upload + processing) — Docker
 
-Serverless platforms (Vercel…) automatically switch to **cloud mode**: the browser uploads directly to GoFile's fleet (CORS-enabled), then a single streamed request downloads the original server-side, runs the same bundled ffmpeg engine (`ffmpeg-static` traced into the function), and mirrors the result back to the same GoFile folder — live NDJSON progress, re-cut without re-upload, `CLOUD_MAX_MB` (default 200) + 300s budget. `/api/cloud/diag` self-reports what works from the host's network. For unlimited sizes / fully-local processing, use the `Dockerfile`:
+Serverless platforms (Vercel…) automatically switch to **cloud mode**: the browser uploads through the chunked system (4MB pieces, each request under the 4.5MB body cap) to the server, which merges on `/tmp` and stores the original on **Bunny Storage** (`BUNNY_STORAGE_ZONE`/`BUNNY_STORAGE_PASSWORD` env). A single streamed request then fetches the original (warm `/tmp` copy first, else Bunny), runs the same bundled ffmpeg engine (`ffmpeg-static` traced into the function), and puts the result back into the same session folder — live NDJSON progress, re-cut without re-upload, signed token links, `CLOUD_MAX_MB` (default 200) + 300s budget. `/api/cloud/diag` self-reports what works from the host's network. For unlimited sizes / fully-local processing, use the `Dockerfile`:
 
 ```bash
 docker build -t autocut .

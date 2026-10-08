@@ -3,9 +3,9 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
-import {
-  resolveBins, resolveGofileDownload, downloadToFile, resolveRunnerPath, type GoFileRef,
-} from '@/lib/cloud'
+import { resolveBins, downloadToFile, resolveRunnerPath } from '@/lib/cloud'
+import { bunnyUrl, bunnyReadHeaders } from '@/lib/bunny-storage'
+import { signPathToken, verifyPathToken, validRemotePath } from '@/lib/storage-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -14,6 +14,7 @@ export const runtime = 'nodejs'
 export const maxDuration = 300
 
 const CLOUD_ROOT = path.join(os.tmpdir(), 'qattaas-cloud')
+const UPLOADS_DIR = '/tmp/uploads'
 const EXT_OK = new Set(['.mp4', '.mov', '.mkv', '.m4v', '.webm', '.avi', '.ts'])
 const DEADLINE_MS = 265_000
 const MAX_CONCURRENT = 2
@@ -21,9 +22,21 @@ let active = 0
 
 type Ev = Record<string, unknown> & { stage: string }
 
-/** POST /api/cloud/cut — body: { file: GoFileRef, settings: {gapMs, thresholdDb, crf} }
- *  Streams NDJSON events: download → cut → done|error. All work happens inside
- *  this single request (serverless-friendly: no shared state, no background jobs). */
+/** the client-side asset ref produced by /api/uploads/chunked/complete */
+type AssetRef = {
+  path: string
+  name: string
+  size: number
+  token: string
+}
+
+/**
+ * POST /api/cloud/cut — body: { file: AssetRef, settings: {gapMs, thresholdDb, crf} }
+ * Streams NDJSON events: download → cut → done|error. All work happens inside
+ * this single request (serverless-friendly: no shared state, no background jobs).
+ * The original comes from Bunny Storage via the signed token (warm /tmp copies
+ * first), and the result lands back in the SAME session folder on Bunny.
+ */
 export async function POST(req: Request) {
   if (active >= MAX_CONCURRENT) {
     return Response.json(
@@ -33,12 +46,16 @@ export async function POST(req: Request) {
   }
 
   const body = await req.json().catch(() => null)
-  const f = body?.file as GoFileRef | undefined
+  const f = body?.file as AssetRef | undefined
   const s = body?.settings || {}
 
-  // ---- validation ----
-  const nameOk = typeof f?.name === 'string' && f.name.length > 0 && f.name.length <= 200
-  if (!f || typeof f.id !== 'string' || !/^[A-Za-z0-9-]{6,64}$/.test(f.id) || !nameOk) {
+  // ---- validation: signed token must cover the exact requested path ----
+  const claims = f?.token ? verifyPathToken(String(f.token)) : null
+  if (!f || !validRemotePath(f.path) || !claims || claims.path !== f.path) {
+    return Response.json({ error: 'بيانات الملف السحابي غير صحيحة أو انتهت صلاحيتها — ارفع الفيديو من جديد' }, { status: 401 })
+  }
+  const nameOk = typeof f.name === 'string' && f.name.length > 0 && f.name.length <= 200
+  if (!nameOk) {
     return Response.json({ error: 'بيانات الملف السحابي غير صحيحة' }, { status: 400 })
   }
   const extRaw = path.extname(f.name).toLowerCase()
@@ -57,9 +74,6 @@ export async function POST(req: Request) {
       { status: 400 },
     )
   }
-  if (f.guestToken !== undefined && (typeof f.guestToken !== 'string' || f.guestToken.length > 4000)) {
-    return Response.json({ error: 'بيانات الملف السحابي غير صحيحة' }, { status: 400 })
-  }
 
   const bins = resolveBins()
   if (!bins.ok) {
@@ -73,7 +87,9 @@ export async function POST(req: Request) {
     return Response.json({ error: 'محرك المعالجة مش موجود على السيرفر ده' }, { status: 500 })
   }
 
-  const jobId = crypto.createHash('sha256').update(`${f.id}:${f.name}`).digest('hex').slice(0, 32)
+  // session folder on Bunny = uploads/<sid>/… ; result goes to the same one
+  const sessionId = f.path.split('/')[1] || 'unknown'
+  const jobId = crypto.createHash('sha256').update(f.path).digest('hex').slice(0, 32)
   const dir = path.join(CLOUD_ROOT, jobId)
 
   const encoder = new TextEncoder()
@@ -98,28 +114,42 @@ export async function POST(req: Request) {
         const jobFile = path.join(dir, 'job.json')
         const progFile = path.join(dir, 'progress.json')
 
-        // ---- 1. bring the original over (skip if a warm /tmp copy matches) ----
+        // ---- 1. bring the original over ----
+        // tier 1: warm copy from a previous cut of the same file
+        // tier 2: the upload session's merged.bin (same instance as complete)
+        // tier 3: download from Bunny Storage (signed path + read key)
         const have = fs.existsSync(src) && (!declaredSize || fs.statSync(src).size === declaredSize)
         if (!have) {
-          send({ stage: 'download', pct: 0, text: 'بننزّل الفيديو من السحابة…' })
-          const dl = await resolveGofileDownload({ ...f, name })
-          const abort = AbortSignal.any([req.signal, AbortSignal.timeout(DEADLINE_MS)])
-          const got = await downloadToFile(dl.url, src, {
-            maxBytes,
-            signal: abort,
-            headers: dl.headers,
-            onProgress: (gotBytes, total) => {
-              const pct = total ? Math.min(99, Math.round((gotBytes / total) * 100)) : 0
-              send({ stage: 'download', pct, text: 'بننزّل الفيديو من السحابة…' })
-            },
-          })
-          if (got < 1000) throw new Error('الملف اللي اتنزّل من السحابة فاضي أو بايظ')
+          const sessionMerged = path.join(UPLOADS_DIR, sessionId, 'merged.bin')
+          let staged = false
+          if (fs.existsSync(sessionMerged)) {
+            try {
+              await fs.promises.copyFile(sessionMerged, src)
+              staged = fs.statSync(src).size > 1000
+                && (!declaredSize || fs.statSync(src).size === declaredSize)
+            } catch { /* fall through to download */ }
+          }
+          if (!staged) {
+            send({ stage: 'download', pct: 0, text: 'بننزّل الفيديو من التخزين السحابي…' })
+            const abort = AbortSignal.any([req.signal, AbortSignal.timeout(DEADLINE_MS)])
+            const got = await downloadToFile(bunnyUrl(f.path), src, {
+              maxBytes,
+              signal: abort,
+              headers: bunnyReadHeaders(),
+              onProgress: (gotBytes, total) => {
+                const pct = total ? Math.min(99, Math.round((gotBytes / total) * 100)) : 0
+                send({ stage: 'download', pct, text: 'بننزّل الفيديو من التخزين السحابي…' })
+              },
+            })
+            if (got < 1000) throw new Error('الملف اللي اتنزّل من التخزين فاضي أو بايظ')
+          }
         }
 
         // ---- 2. job.json for the runner ----
         const size = fs.statSync(src).size
         fs.writeFileSync(jobFile, JSON.stringify({
           id: jobId, name, size, ext, phase: 'uploaded', uploaded: size, createdAt: Date.now(),
+          asset: { path: f.path },
         }))
 
         // ---- 3. run the exact same proven pipeline (scan + plan + cut + mirror) ----
@@ -130,8 +160,7 @@ export async function POST(req: Request) {
           FFMPEG_PATH: bins.ffmpeg,
           FFPROBE_PATH: bins.ffprobe,
           QATTAAS_CLOUD: '1',
-          ...(f.guestToken ? { GOFILE_TOKEN: f.guestToken } : {}),
-          ...(f.parentFolder ? { GOFILE_FOLDER_ID: f.parentFolder } : {}),
+          QATTAAS_RESULT_DIR: `uploads/${sessionId}`,
         }
         child = spawn(
           process.execPath,
@@ -183,12 +212,15 @@ export async function POST(req: Request) {
         else {
           const job = readJSON(jobFile)
           if (job && job.phase === 'done') {
+            const storage = job.storage || null
             send({
               stage: 'done',
               result: {
-                original: f.downloadPage || null,
-                resultUrl: job.gofile?.url || job.bunny?.url || null,
-                bunny: job.bunny || null,
+                original: `/api/uploads/stream?t=${signPathToken(f.path)}`,
+                resultUrl: storage?.path
+                  ? `/api/uploads/stream?t=${signPathToken(storage.path)}&dl=1`
+                  : null,
+                storage,
                 output: job.output || null,
                 plan: job.plan || null,
                 meta: job.meta || null,

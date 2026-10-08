@@ -32,7 +32,7 @@ const AR = {
   muxing: 'نجمّع الملف النهائي…',
   verifying: 'نتأكد من الملف النهائي…',
   cleanup: 'ننظف الملفات المؤقتة…',
-  mirroring: 'نحفظ نسخة خارجية من النتيجة…',
+  mirroring: 'نحفظ النتيجة على التخزين السحابي…',
   done: 'خلصنا! 🎉',
 }
 
@@ -260,275 +260,68 @@ async function buildAudio(plan, onByte) {
   return { written, totalOut }
 }
 
-// ---------------------------------------------------------------- gofile mirror
+// --------------------------------------------------------- bunny storage mirror
 /**
- * Best-effort mirror of the final file to GoFile (free file host) so the
- * download link survives ephemeral hosts (Colab session end, container
- * restarts). Never throws — returns { url } on success, null otherwise.
- * Disable with env GOFILE_MIRROR=0.
+ * Upload the final file to Bunny Storage (the مستر منعم upload system's
+ * storage layer) so the result survives ephemeral hosts. The file lands in
+ * the SAME session folder as the original (uploads/<sid>/result-<stamp>.mp4)
+ * and the API route signs a delivery token for it. Never throws —
+ * returns { path, size } on success, null otherwise.
+ * Env: BUNNY_STORAGE_ZONE, BUNNY_STORAGE_PASSWORD (+ optional
+ * BUNNY_STORAGE_HOST override for self-hosted/test setups),
+ * QATTAAS_RESULT_DIR (cloud mode passes the original's session folder).
  */
-async function mirrorToGoFile(file, name) {
-  if (process.env.GOFILE_MIRROR === '0') return null
-  // GOFILE_API (advanced): point the mirror at another GoFile-compatible API —
-  // used for testing/self-hosting. Server entries containing ':' are treated as
-  // absolute origins (e.g. http://localhost:9876); plain names get .gofile.io.
-  const API_BASE = process.env.GOFILE_API || 'https://api.gofile.io'
-  const cacheFile = path.join(ROOT, '..', '.gofile.json')
-  const jGet = async (url, opts) => {
-    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30_000) })
-    const j = await r.json().catch(() => null)
-    if (!j || j.status !== 'ok') throw new Error(`gofile api ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
-    return j.data
-  }
-  try {
-    let { token, server } = (() => {
-      try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')) } catch { return {} }
-    })()
-    // GOFILE_TOKEN / GOFILE_FOLDER_ID — cloud mode passes the browser-created
-    // guest account so the result lands next to the original in the SAME public
-    // folder (one download page shows both files).
-    const extToken = process.env.GOFILE_TOKEN
-    const extFolder = process.env.GOFILE_FOLDER_ID
-    if (extToken) token = extToken
-    if (!token) {
-      const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
-      token = acc.token
-    }
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (!server) {
-        const d = await jGet(`${API_BASE}/servers`)
-        const servers = (d.servers || []).map((s) => s.name).filter(Boolean)
-        if (!servers.length) throw new Error('no gofile servers available')
-        server = servers[Math.floor(Math.random() * servers.length)]
-      }
-      try {
-        // stream from disk when the runtime supports it; fall back to a buffer
-        let blob
-        try { blob = await fs.promises.openAsBlob(file) }
-        catch { blob = new Blob([await fs.promises.readFile(file)]) }
-        const fd = new FormData()
-        fd.append('file', blob, name)
-        fd.append('token', token)
-        if (extFolder) fd.append('folderId', extFolder)
-        const origin = /^[a-z0-9.-]+$/i.test(server) ? `https://${server}.gofile.io` : `http://${server}`
-        const r = await fetch(`${origin}/contents/uploadfile`, {
-          method: 'POST', body: fd, signal: AbortSignal.timeout(30 * 60_000),
-        })
-        const j = await r.json().catch(() => null)
-        if (!j || j.status !== 'ok') throw new Error(`upload failed ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
-        if (!extToken) { try { fs.writeFileSync(cacheFile, JSON.stringify({ token, server })) } catch { /* cache is best-effort */ } }
-        logStd(`gofile: mirrored to ${j.data.downloadPage} (${server})`)
-        return { url: j.data.downloadPage }
-      } catch (e) {
-        logStd(`gofile attempt ${attempt + 1} on ${server} failed: ${e.message}`)
-        server = null
-        // token may be stale → fresh guest account for the retry
-        if (attempt === 0) {
-          try {
-            const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
-            token = acc.token
-          } catch (e2) { logStd(`gofile token refresh failed: ${e2.message}`) }
-        }
-      }
-    }
-    return null
-  } catch (e) {
-    logStd(`gofile mirror skipped: ${e.message}`)
+async function mirrorToBunnyStorage(file) {
+  const zone = String(process.env.BUNNY_STORAGE_ZONE || 'qattaas').trim()
+  const password = String(process.env.BUNNY_STORAGE_PASSWORD || '').trim()
+  if (!password) {
+    logStd('storage: skipped (BUNNY_STORAGE_PASSWORD not configured)')
     return null
   }
-}
-
-// ---------------------------------------------------------------- bunny stream mirror
-/** best direct-MP4 URL for a Bunny video (needs BUNNY_CDN_HOST + resolutions) */
-function bunnyBestMp4(guid, resos) {
-  const cdn = String(process.env.BUNNY_CDN_HOST || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '')
-  if (!cdn || !resos) return null
-  const best = String(resos).split(',').map((r) => parseInt(r, 10)).filter((n) => n > 0).sort((a, b) => b - a)[0]
-  return best ? `https://${cdn}/${guid}/play_${best}p.mp4` : null
-}
-/** Stream zones block referer-less requests — verify with the embed page as referer */
-async function bunnyMp4Works(mp4, referer) {
+  const dirBase = String(process.env.QATTAAS_RESULT_DIR || `uploads/${jobId}`).replace(/\/+$/, '')
+  const remotePath = `${dirBase}/result-${Date.now().toString(36)}.mp4`
+  const hostRaw = String(process.env.BUNNY_STORAGE_HOST || 'storage.bunnycdn.com').replace(/\/+$/, '')
+  const base = hostRaw.startsWith('http') ? `${hostRaw}/${zone}` : `https://${hostRaw}/${zone}`
   try {
-    const h = await fetch(mp4, { method: 'HEAD', headers: { referer }, signal: AbortSignal.timeout(20_000) })
-    if (h.ok) return true
-    logStd(`bunny: mp4 HEAD ${h.status} — dropping direct link`)
-  } catch { /* network hiccup → treat as unavailable */ }
-  return false
-}
-
-/**
- * Best-effort mirror of the final file to Bunny Stream (paid CDN, survives
- * everything, gives a hosted player page). Preferred over GoFile when
- * configured. Needs:
- *   BUNNY_STREAM_LIBRARY_ID — the numeric library id (Stream → library → API)
- *   BUNNY_STREAM_API_KEY    — the library API key (UUID)
- *   BUNNY_STREAM_API_KEY_ALT — optional second key to try (same library)
- *   BUNNY_CDN_HOST — optional library CDN host (e.g. vz-xxx.b-cdn.net): enables a
- *     direct MP4 link (best encoded resolution). Note: Stream zones block
- *     referer-less requests, so that link is meant to be CLICKED from a page
- *     (e.g. our UI) — the embed player link always works everywhere.
- *   BUNNY_API_BASE / BUNNY_EMBED_BASE — overrides for testing/self-hosting
- * Never throws — returns { url, guid, mp4? } on success, null otherwise.
- */
-async function mirrorToBunnyStream(file, name) {
-  const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
-  if (!libId || !/^\d+$/.test(libId)) return null
-  const keys = [process.env.BUNNY_STREAM_API_KEY, process.env.BUNNY_STREAM_API_KEY_ALT]
-    .map((k) => String(k || '').trim()).filter(Boolean)
-  if (!keys.length) return null
-
-  const API = (process.env.BUNNY_API_BASE || 'https://video.bunnycdn.com').replace(/\/$/, '')
-  const EMBED = (process.env.BUNNY_EMBED_BASE || 'https://iframe.mediadelivery.net/embed').replace(/\/$/, '')
-
-  const jReq = async (path, key, opts = {}) => {
-    const r = await fetch(`${API}/library/${libId}${path}`, {
-      ...opts,
-      headers: { AccessKey: key, accept: 'application/json', ...(opts.headers || {}) },
-      signal: opts.signal || AbortSignal.timeout(60_000),
-    })
-    const j = await r.json().catch(() => null)
-    if (!r.ok) throw new Error(`bunny ${path.split('?')[0]} ${r.status} ${JSON.stringify(j).slice(0, 160)}`)
-    return j
-  }
-
-  try {
-    // 1. create the video entry (try each configured key)
-    let key = null
-    let created = null
-    let lastErr = null
-    for (const k of keys) {
-      try {
-        created = await jReq('/videos', k, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: name }) })
-        key = k
-        break
-      } catch (e) { lastErr = e }
-    }
-    if (!created) throw lastErr || new Error('bunny create failed')
-    const guid = created.guid || created.videoGuid || created.id || (created.data && (created.data.guid || created.data.id))
-    if (!guid || typeof guid !== 'string') throw new Error(`bunny create returned no guid: ${JSON.stringify(created).slice(0, 160)}`)
-
-    // 2. upload the bytes (stream from disk when possible)
-    let blob
-    try { blob = await fs.promises.openAsBlob(file) }
-    catch { blob = new Blob([await fs.promises.readFile(file)]) }
-    const up = await fetch(`${API}/library/${libId}/videos/${guid}`, {
+    mirrorStageText = `${AR.mirroring}`
+    progress({ phase: 'mirroring', stage: mirrorStageText, pct: 99 })
+    // stream from disk when the runtime supports it; fall back to a buffer
+    let body
+    try { body = await fs.promises.openAsBlob(file) }
+    catch { body = new Blob([await fs.promises.readFile(file)]) }
+    const r = await fetch(`${base}/${remotePath}`, {
       method: 'PUT',
-      headers: { AccessKey: key, 'content-type': 'application/octet-stream' },
-      body: blob,
-      signal: AbortSignal.timeout(60 * 60_000),
+      headers: { AccessKey: password, 'Content-Type': 'application/octet-stream' },
+      body,
+      signal: AbortSignal.timeout(30 * 60_000),
     })
-    if (!up.ok) throw new Error(`bunny upload ${up.status} ${(await up.text().catch(() => '')).slice(0, 160)}`)
-
-    // 3. short encode poll — status 4 = finished, availableResolutions = MP4s
-    //    ready. If the encode queue is slow we don't block `done`: the embed
-    //    link works on its own and a post-done catch-up adds the MP4 link later.
-    let status = -1
-    let resos = null
-    let last = null
-    for (let i = 0; i < 6; i++) {
-      await new Promise((r) => setTimeout(r, i === 0 ? 4000 : 12000))
-      try {
-        last = await jReq(`/videos/${guid}`, key)
-        status = Number(last.status ?? -1)
-        resos = last.availableResolutions || null
-        const ep = Math.round(Number(last.encodeProgress ?? 0))
-        if (ep > 0 && ep < 100) {
-          mirrorStageText = `${AR.mirroring} (ترميز Bunny ${ep}%)`
-          progress({ phase: 'mirroring', stage: mirrorStageText, pct: 99 })
-        }
-        if (status === 4 || resos) break
-        if (status === 5 || status === 6) throw new Error(`bunny encode status ${status}`)
-      } catch (e) {
-        if (String(e.message).includes('status 5') || String(e.message).includes('status 6')) throw e
-        // transient poll failure → keep waiting
-      }
-    }
-    const embed = last && last.iframeSrc ? `https:${last.iframeSrc}` : `${EMBED}/${libId}/${guid}`
-    let mp4 = bunnyBestMp4(guid, resos)
-    if (mp4 && !(await bunnyMp4Works(mp4, embed))) mp4 = null
-    logStd(`bunny: mirrored ${guid} (encode status ${status}${mp4 ? ', mp4 ready' : ''})`)
-    return { url: embed, guid, ...(mp4 ? { mp4 } : {}) }
+    if (!r.ok) throw new Error(`PUT ${r.status} ${(await r.text().catch(() => '')).slice(0, 160)}`)
+    const size = fs.statSync(file).size
+    logStd(`storage: result saved at ${remotePath} (${size} bytes)`)
+    return { path: remotePath, size }
   } catch (e) {
-    logStd(`bunny mirror failed: ${e.message}`)
+    logStd(`storage mirror failed: ${e.message}`)
     return null
   }
 }
 
-/** after `done`: if the encode queue was slow, keep polling for the finished
- *  encode and return the direct MP4 link (bounded ~8 min, never throws). */
-async function catchUpBunnyMp4(bunny) {
-  try {
-    const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
-    const key = String(process.env.BUNNY_STREAM_API_KEY || process.env.BUNNY_STREAM_API_KEY_ALT || '').trim()
-    if (!libId || !/^\d+$/.test(libId) || !key || !bunny.guid) return null
-    const API = (process.env.BUNNY_API_BASE || 'https://video.bunnycdn.com').replace(/\/$/, '')
-    let headFails = 0
-    for (let i = 0; i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 12_000))
-      try {
-        const r = await fetch(`${API}/library/${libId}/videos/${bunny.guid}`, {
-          headers: { AccessKey: key, accept: 'application/json' },
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (!r.ok) continue
-        const v = await r.json().catch(() => null)
-        const mp4 = bunnyBestMp4(bunny.guid, v && v.availableResolutions)
-        if (!mp4) continue
-        // the MP4 file can lag a few seconds behind the resolutions metadata
-        // (transient 404 on the edge) → keep polling instead of giving up
-        if (await bunnyMp4Works(mp4, bunny.url)) return mp4
-        if (++headFails >= 5) return null // MP4 access genuinely unavailable
-      } catch { /* transient → keep waiting */ }
-    }
-    return null
-  } catch { return null }
-}
-
-/** output is on disk → mirror it externally → finish. Download stays available
- *  during the mirror (the UI shows the button from phase 'mirroring'). */
-let mirrorStageText = null // live stage text while a mirror uploads/polls
+/** output is on disk → upload it to Bunny Storage → finish. Download stays
+ *  available during the upload (the UI shows the button from phase 'mirroring'). */
+let mirrorStageText = null // live stage text while the storage upload runs
 
 async function finish(outPath, output) {
-  // drop stale mirror links from a previous render of the same job
-  setPhase('mirroring', { output, gofile: undefined, bunny: undefined })
+  // drop stale storage links from a previous render of the same job
+  setPhase('mirroring', { output, storage: undefined })
   mirrorStageText = null
   progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 })
   // heartbeat so the API stall-detector (10 min) never kills a long upload
   const hb = setInterval(() => {
     try { progress({ phase: 'mirroring', stage: mirrorStageText || AR.mirroring, pct: 99 }) } catch { /* shutting down */ }
   }, 15_000)
-  const base = String(job.name || 'video').replace(/\.[^.]+$/, '') || 'video'
-  const outName = `${base}-qattaas.mp4`
-  // cloud runs are bounded by the request budget — skip Bunny entirely (its
-  // encode queue can take minutes) and mirror straight to GoFile
-  const cloudRun = process.env.QATTAAS_CLOUD === '1'
-  let ext = cloudRun ? null : await mirrorToBunnyStream(outPath, outName)
-  let extField = ext ? { bunny: ext } : null
-  if (!ext) {
-    ext = await mirrorToGoFile(outPath, outName)
-    extField = ext ? { gofile: ext } : null
-  }
+  const ext = await mirrorToBunnyStorage(outPath)
   clearInterval(hb)
-  setPhase('done', extField || {})
+  setPhase('done', ext ? { storage: ext } : {})
   progress({ phase: 'done', stage: AR.done, pct: 100 })
-  // post-done catch-up: slow Bunny encode queue → add the direct MP4 link when
-  // it appears; the UI picks it up on its next status poll (it keeps polling
-  // at `done`). Only writes if this guid is still the live one (re-render safe).
-  if (extField && extField.bunny && !extField.bunny.mp4) {
-    const mp4 = await catchUpBunnyMp4(extField.bunny)
-    if (mp4) {
-      try {
-        const j = JSON.parse(fs.readFileSync(jobFile, 'utf8'))
-        if (j.phase === 'done' && j.bunny && j.bunny.guid === extField.bunny.guid) {
-          j.bunny.mp4 = mp4
-          writeJSON(jobFile, j)
-          logStd(`bunny: mp4 link added post-done (${mp4})`)
-        }
-      } catch { /* best-effort */ }
-    } else {
-      logStd('bunny: mp4 catch-up ended without a link (encode too slow or blocked)')
-    }
-  }
 }
 
 // ---------------------------------------------------------------- video chunks
