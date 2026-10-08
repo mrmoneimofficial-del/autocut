@@ -14,7 +14,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'storage', 'jobs')
+// QATTAAS_JOBS_ROOT — cloud mode (api/cloud/cut) points the runner at an
+// ephemeral /tmp job dir instead of the persistent ./storage/jobs tree.
+const ROOT = process.env.QATTAAS_JOBS_ROOT
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'storage', 'jobs')
+
+// FFMPEG_PATH / FFPROBE_PATH — serverless hosts (Vercel…) have no system
+// ffmpeg; the API route resolves ffmpeg-static/ffprobe-static and passes the
+// absolute binary paths here.
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg'
+const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe'
 
 const AR = {
   scanning: 'نمسح الصمت ونحدد الفجوات…',
@@ -66,7 +75,7 @@ function progress(p) {
 /** run ffmpeg, capture stderr, resolve on exit 0 */
 function ff(args, { onStderr } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn('ffmpeg', ['-nostdin', '-y', '-hide_banner', ...args], {
+    const p = spawn(FFMPEG, ['-nostdin', '-y', '-hide_banner', ...args], {
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     let err = ''
@@ -82,7 +91,7 @@ function ff(args, { onStderr } = {}) {
 
 function probe(file) {
   return new Promise((resolve, reject) => {
-    const p = spawn('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file])
+    const p = spawn(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file])
     let out = ''
     p.stdout.on('data', (d) => (out += d))
     p.on('close', (code) => {
@@ -202,8 +211,8 @@ async function buildAudio(plan, onByte) {
   const totalOut = ranges.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
   onByte(0, totalOut) // initial tick so callers learn the target size immediately
 
-  const dec = spawn('ffmpeg', ['-nostdin', '-hide_banner', '-i', src, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', 'pipe:1'], { stdio: ['ignore', 'pipe', 'ignore'] })
-  const enc = spawn('ffmpeg', ['-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sr), '-ac', String(ch), '-i', 'pipe:0', '-c:a', 'aac', '-b:a', '96k', path.join(dir, 'audio.m4a')], { stdio: ['pipe', 'ignore', 'pipe'] })
+  const dec = spawn(FFMPEG, ['-nostdin', '-hide_banner', '-i', src, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', 'pipe:1'], { stdio: ['ignore', 'pipe', 'ignore'] })
+  const enc = spawn(FFMPEG, ['-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sr), '-ac', String(ch), '-i', 'pipe:0', '-c:a', 'aac', '-b:a', '96k', path.join(dir, 'audio.m4a')], { stdio: ['pipe', 'ignore', 'pipe'] })
 
   let encErr = ''
   enc.stderr.on('data', (d) => (encErr += d.toString()))
@@ -275,6 +284,12 @@ async function mirrorToGoFile(file, name) {
     let { token, server } = (() => {
       try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')) } catch { return {} }
     })()
+    // GOFILE_TOKEN / GOFILE_FOLDER_ID — cloud mode passes the browser-created
+    // guest account so the result lands next to the original in the SAME public
+    // folder (one download page shows both files).
+    const extToken = process.env.GOFILE_TOKEN
+    const extFolder = process.env.GOFILE_FOLDER_ID
+    if (extToken) token = extToken
     if (!token) {
       const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
       token = acc.token
@@ -294,13 +309,14 @@ async function mirrorToGoFile(file, name) {
         const fd = new FormData()
         fd.append('file', blob, name)
         fd.append('token', token)
+        if (extFolder) fd.append('folderId', extFolder)
         const origin = /^[a-z0-9.-]+$/i.test(server) ? `https://${server}.gofile.io` : `http://${server}`
         const r = await fetch(`${origin}/contents/uploadfile`, {
           method: 'POST', body: fd, signal: AbortSignal.timeout(30 * 60_000),
         })
         const j = await r.json().catch(() => null)
         if (!j || j.status !== 'ok') throw new Error(`upload failed ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
-        try { fs.writeFileSync(cacheFile, JSON.stringify({ token, server })) } catch { /* cache is best-effort */ }
+        if (!extToken) { try { fs.writeFileSync(cacheFile, JSON.stringify({ token, server })) } catch { /* cache is best-effort */ } }
         logStd(`gofile: mirrored to ${j.data.downloadPage} (${server})`)
         return { url: j.data.downloadPage }
       } catch (e) {
@@ -483,8 +499,10 @@ async function finish(outPath, output) {
   }, 15_000)
   const base = String(job.name || 'video').replace(/\.[^.]+$/, '') || 'video'
   const outName = `${base}-qattaas.mp4`
-  // Bunny Stream first (permanent CDN + player); GoFile as fallback
-  let ext = await mirrorToBunnyStream(outPath, outName)
+  // cloud runs are bounded by the request budget — skip Bunny entirely (its
+  // encode queue can take minutes) and mirror straight to GoFile
+  const cloudRun = process.env.QATTAAS_CLOUD === '1'
+  let ext = cloudRun ? null : await mirrorToBunnyStream(outPath, outName)
   let extField = ext ? { bunny: ext } : null
   if (!ext) {
     ext = await mirrorToGoFile(outPath, outName)

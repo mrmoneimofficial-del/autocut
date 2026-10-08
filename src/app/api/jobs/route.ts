@@ -1,12 +1,36 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { resolveBins } from '@/lib/cloud'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const EXT_OK = new Set(['.mp4', '.mov', '.mkv', '.m4v', '.webm', '.avi', '.ts'])
+
+/**
+ * GET /api/jobs — capability probe. The frontend calls this on load to pick
+ * its flow:
+ *   mode 'server'     → storage writable → classic chunked upload + local pipeline
+ *   mode 'cloud'      → storage read-only (Vercel…) but ffmpeg available →
+ *                       browser-direct GoFile upload + streamed cloud cut
+ *   mode 'cloud-lite' → neither → upload + share link only (no cut here)
+ */
+export async function GET() {
+  let storageOK = false
+  try {
+    fs.mkdirSync(ROOT, { recursive: true })
+    const probe = path.join(ROOT, `.probe-${Date.now().toString(36)}-${process.pid}`)
+    fs.writeFileSync(probe, 'ok')
+    fs.rmSync(probe, { force: true })
+    storageOK = true
+  } catch { /* read-only serverless FS */ }
+  const cloud = { maxMB: Number(process.env.CLOUD_MAX_MB || 200) }
+  if (storageOK) return Response.json({ ok: true, mode: 'server' })
+  const bins = resolveBins()
+  return Response.json({ ok: true, mode: bins.ok ? 'cloud' : 'cloud-lite', cloud })
+}
 
 /** POST /api/jobs — { name, size } → { id } */
 export async function POST(req: Request) {

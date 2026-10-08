@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
   AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket, Github,
-  Pause, Play, X,
+  Pause, Play, X, Cloud,
 } from 'lucide-react'
 
 /* ------------------------------------------------------------------ types */
@@ -23,6 +23,28 @@ type Job = {
   plan?: { durationMs: number; keptMs: number; savedMs: number; cutsCount: number; cuts: Cut[]; settings: { gapMs: number; thresholdDb: number } }
   output?: { size: number; durationMs: number; cutsCount: number }
   progress?: { phase: string; stage: string; pct: number; speedX?: number; etaSec?: number } | null
+}
+
+/* cloud mode — browser uploads directly to GoFile, server downloads + cuts + mirrors */
+type CloudRef = {
+  id: string
+  name: string
+  size: number
+  server?: string
+  guestToken?: string
+  parentFolder?: string
+  downloadPage?: string
+}
+type CloudState = {
+  phase: 'uploading' | 'cutting' | 'done' | 'error'
+  file?: File
+  sent: number
+  speed: number
+  ref?: CloudRef
+  cut?: { stage: string; pct: number; text?: string; speedX?: number; etaSec?: number }
+  result?: { original?: string | null; resultUrl?: string | null; output?: any; plan?: any; meta?: any }
+  error?: string
+  retryUpload?: boolean
 }
 
 const fmtTime = (ms: number) => {
@@ -252,6 +274,11 @@ export default function Home() {
   const [gapMs, setGapMs] = useState(200)
   const [thr, setThr] = useState(-35)
   const [crf, setCrf] = useState(32)
+  /* cloud mode */
+  const [srvMode, setSrvMode] = useState<'server' | 'cloud' | null>(null)
+  const [cloudCutOK, setCloudCutOK] = useState(true)
+  const [cloudMaxMB, setCloudMaxMB] = useState(200)
+  const [cloud, setCloud] = useState<CloudState | null>(null)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const playheadRef = useRef<HTMLDivElement>(null)
@@ -263,6 +290,16 @@ export default function Home() {
   const upAbort = useRef<AbortController | null>(null)
   const upFileRef = useRef<File | null>(null)
   const upIdRef = useRef<string>('')
+  /* mode probe promise — file picks await it so the right flow starts even if
+     the user drops a file before the probe lands */
+  const modeReadyRef = useRef<{ promise: Promise<'server' | 'cloud'>; resolve: (m: 'server' | 'cloud') => void } | null>(null)
+  if (!modeReadyRef.current) {
+    let resolve!: (m: 'server' | 'cloud') => void
+    const promise = new Promise<'server' | 'cloud'>((r) => { resolve = r })
+    modeReadyRef.current = { promise, resolve }
+  }
+  const cloudAbort = useRef<AbortController | null>(null)
+  const startCloudRef = useRef<(f: File) => void>(() => {})
 
   useEffect(() => { skipRef.current = skip }, [skip])
   useEffect(() => { viewRef.current = view }, [view])
@@ -279,11 +316,46 @@ export default function Home() {
     } catch { /* offline tick */ }
   }, [])
 
-  // restore last job on mount
+  // capability probe: server pipeline vs cloud mode (Vercel…) + cloud result restore
   useEffect(() => {
+    let alive = true
+    ;(async () => {
+      let m: 'server' | 'cloud' = 'server'
+      let cutOK = true
+      let maxMB = 200
+      try {
+        const r = await fetch('/api/jobs', { cache: 'no-store' })
+        const j = await r.json()
+        if (j?.ok && (j.mode === 'cloud' || j.mode === 'cloud-lite')) {
+          m = 'cloud'
+          cutOK = j.mode === 'cloud'
+          maxMB = Number(j.cloud?.maxMB || 200)
+        }
+      } catch { /* probe failed → classic server flow */ }
+      if (new URLSearchParams(window.location.search).get('mode') === 'cloud') m = 'cloud'
+      if (!alive) return
+      modeReadyRef.current!.resolve(m)
+      setSrvMode(m)
+      setCloudCutOK(cutOK)
+      setCloudMaxMB(maxMB)
+      if (m === 'cloud') {
+        try {
+          const saved = JSON.parse(localStorage.getItem('qattaas:cloud:last') || 'null')
+          if (saved?.result && Date.now() - Number(saved.at || 0) < 24 * 3600_000) {
+            setCloud({ phase: 'done', sent: 0, speed: 0, ref: saved.ref, result: saved.result })
+          }
+        } catch { /* ignore */ }
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  // restore last job on mount (server mode only)
+  useEffect(() => {
+    if (srvMode === 'cloud') return
     const id = localStorage.getItem('qattaas:job')
     if (id) refresh(id)
-  }, [refresh])
+  }, [refresh, srvMode])
 
   // polling
   useEffect(() => {
@@ -382,6 +454,151 @@ export default function Home() {
     await runUploadAndAnalyze(id, file, resumeIntervals)
   }, [runUploadAndAnalyze])
 
+  /* --------------------------------------------- cloud mode: cut + upload */
+  /** POST /api/cloud/cut and consume its NDJSON event stream */
+  const runCloudCut = useCallback(async (ref: CloudRef) => {
+    const ac = new AbortController()
+    cloudAbort.current = ac
+    setCloud((c) => ({ ...(c || { sent: 0, speed: 0 }), phase: 'cutting', ref, cut: { stage: 'prep', pct: 0, text: 'بنجهّز المعالجة…' } }))
+    try {
+      const r = await fetch('/api/cloud/cut', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: ref, settings: { gapMs, thresholdDb: thr, crf } }),
+        signal: ac.signal,
+      })
+      if (!r.ok || !r.body) {
+        const j = await r.json().catch(() => null)
+        throw new Error(j?.error || `فشل بدء القص (${r.status})`)
+      }
+      const reader = r.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      let finished = false
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line) continue
+          let ev: any
+          try { ev = JSON.parse(line) } catch { continue }
+          if (ev.stage === 'download') {
+            setCloud((c) => c ? { ...c, cut: { stage: 'download', pct: ev.pct || 0, text: 'بننزّل الفيديو من السحابة…' } } : c)
+          } else if (ev.stage === 'cut') {
+            setCloud((c) => c ? { ...c, cut: { stage: 'cut', pct: ev.pct || 0, text: ev.text, speedX: ev.speedX, etaSec: ev.etaSec } } : c)
+          } else if (ev.stage === 'done') {
+            finished = true
+            setCloud((c) => c ? { ...c, phase: 'done', result: ev.result } : c)
+            try { localStorage.setItem('qattaas:cloud:last', JSON.stringify({ ref, result: ev.result, at: Date.now() })) } catch { /* full */ }
+            try { localStorage.removeItem('qattaas:cloud:file') } catch { /* noop */ }
+          } else if (ev.stage === 'error') {
+            throw new Error(ev.error || 'المعالجة فشلت')
+          }
+        }
+      }
+      if (!finished) {
+        setCloud((c) => (c && c.phase === 'cutting'
+          ? { ...c, phase: 'error', error: 'انقطع الاتصال بالمعالجة — لو الفيديو كبير جرّب نسخة أصغر أو النسخة الكاملة (كولاب/كودسبيسز)' }
+          : c))
+      }
+    } catch (e: any) {
+      if (ac.signal.aborted) { setCloud(null); return }
+      setCloud((c) => ({ ...(c || { sent: 0, speed: 0, phase: 'cutting' as const }), phase: 'error' as const, error: e?.message || 'فشل القص' }))
+    }
+  }, [gapMs, thr, crf])
+
+  /** upload the file DIRECTLY from the browser to GoFile's fleet, then cut */
+  const startCloudUpload = useCallback(async (file: File) => {
+    setJobErr(null)
+    setNotice(null)
+    let uploadUrl = 'https://upload.gofile.io/uploadfile'
+    try {
+      const r = await fetch('/api/cloud/prepare', { cache: 'no-store' })
+      if (r.ok) {
+        const j = await r.json()
+        uploadUrl = j.upload || uploadUrl
+        if (j.maxMB) setCloudMaxMB(Number(j.maxMB))
+      }
+    } catch { /* defaults */ }
+    if (file.size > cloudMaxMB * 1024 * 1024) {
+      setCloud({
+        phase: 'error', sent: 0, speed: 0, file, retryUpload: false,
+        error: `الفيديو أكبر من ${cloudMaxMB} م.ب — ده الحد الأقصى للمسار السحابي. للفيديوهات الأكبر شغّل النسخة الكاملة مجانًا (Colab / Codespaces).`,
+      })
+      return
+    }
+    const ac = new AbortController()
+    cloudAbort.current = ac
+    setCloud({ phase: 'uploading', file, sent: 0, speed: 0 })
+    const tr = { last: 0, at: Date.now() }
+    try {
+      const data = await new Promise<any>((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open('POST', uploadUrl)
+        ac.signal.addEventListener('abort', () => xhr.abort(), { once: true })
+        xhr.upload.onprogress = (e) => {
+          const now = Date.now()
+          if (now - tr.at > 600 && e.loaded > tr.last) {
+            const speed = ((e.loaded - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
+            tr.last = e.loaded; tr.at = now
+            setCloud((c) => c ? { ...c, sent: e.loaded, speed } : c)
+          } else {
+            setCloud((c) => c ? { ...c, sent: e.loaded } : c)
+          }
+        }
+        xhr.onload = () => {
+          try {
+            const j = JSON.parse(xhr.responseText)
+            if (j?.status === 'ok' && j.data) resolve(j.data)
+            else reject(new Error(`GoFile رفض الرفع (${j?.status || xhr.status})`))
+          } catch { reject(new Error('استجابة غير مقروءة من GoFile')) }
+        }
+        xhr.onerror = () => reject(new Error('الرفع على GoFile اتقطع — اتأكد من النت وجرّب تاني'))
+        xhr.onabort = () => reject(Object.assign(new Error('اتلغى الرفع'), { name: 'CancelError' }))
+        xhr.timeout = 0 // large uploads: no client-side timeout
+        const fd = new FormData()
+        fd.append('file', file, file.name)
+        xhr.send(fd)
+      })
+      const ref: CloudRef = {
+        id: String(data.id),
+        name: String(data.name || file.name),
+        size: Number(data.size || file.size),
+        ...(data.servers?.[0] ? { server: String(data.servers[0]) } : {}),
+        ...(data.guestToken ? { guestToken: String(data.guestToken) } : {}),
+        ...(data.parentFolder ? { parentFolder: String(data.parentFolder) } : {}),
+        ...(data.downloadPage ? { downloadPage: String(data.downloadPage) } : {}),
+      }
+      if (!ref.id) throw new Error('استجابة GoFile ناقصة بيانات الملف')
+      await runCloudCut(ref)
+    } catch (e: any) {
+      if (e?.name === 'CancelError') { setCloud(null); return }
+      setCloud((c) => ({
+        phase: 'error', sent: 0, speed: 0, file, retryUpload: true,
+        error: e?.message || 'فشل الرفع على GoFile',
+      }))
+    }
+  }, [runCloudCut, cloudMaxMB])
+
+  useEffect(() => { startCloudRef.current = startCloudUpload }, [startCloudUpload])
+
+  /** route a picked file to the right flow once the mode probe has landed */
+  const handleFilePick = useCallback(async (file: File) => {
+    const m = await modeReadyRef.current!.promise
+    if (m === 'cloud') startCloudRef.current(file)
+    else startUpload(file)
+  }, [startUpload])
+
+  const cancelCloud = () => {
+    cloudAbort.current?.abort()
+    try { localStorage.removeItem('qattaas:cloud:file') } catch { /* noop */ }
+    setCloud(null)
+  }
+
   const pauseUpload = () => {
     upCtrl.current.paused = true
     upAbort.current?.abort() // in-flight chunks abort → lanes drain gracefully
@@ -426,26 +643,32 @@ export default function Home() {
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
+    try {
+      localStorage.removeItem('qattaas:cloud:last')
+      localStorage.removeItem('qattaas:cloud:file')
+    } catch { /* noop */ }
+    cloudAbort.current?.abort()
     setJob(null); setUp(null); setJobErr(null); setNotice(null); setShowcase(false); setView('src'); setSkip(true); setUpPaused(false)
+    setCloud(null)
   }
 
   /* smart input #1 — paste a video straight from the clipboard (Ctrl+V) */
   useEffect(() => {
-    if (job || up) return
+    if (job || up || cloud) return
     const onPaste = (e: ClipboardEvent) => {
       const f = Array.from(e.clipboardData?.files || [])[0]
       if (f && f.size > 1000) {
         e.preventDefault()
-        startUpload(f)
+        handleFilePick(f)
       }
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [job, up, startUpload])
+  }, [job, up, cloud, handleFilePick])
 
   /* smart input #2 — drop a video ANYWHERE on the page (full-screen overlay) */
   useEffect(() => {
-    if (job || up) return
+    if (job || up || cloud) return
     let depth = 0
     const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files')
     const onEnter = (e: DragEvent) => { if (hasFiles(e)) { depth++; setDragOver(true) } }
@@ -456,7 +679,7 @@ export default function Home() {
       e.preventDefault()
       depth = 0; setDragOver(false)
       const f = e.dataTransfer?.files?.[0]
-      if (f && f.size > 1000) startUpload(f)
+      if (f && f.size > 1000) handleFilePick(f)
     }
     window.addEventListener('dragenter', onEnter)
     window.addEventListener('dragleave', onLeave)
@@ -468,7 +691,7 @@ export default function Home() {
       window.removeEventListener('dragover', onOver)
       window.removeEventListener('drop', onDrop)
     }
-  }, [job, up, startUpload])
+  }, [job, up, cloud, handleFilePick])
 
   /* smart skip + playhead */
   const onTimeUpdate = useCallback(() => {
@@ -509,6 +732,312 @@ export default function Home() {
   const seekTo = (ms: number) => {
     const v = videoRef.current
     if (v) v.currentTime = ms / 1000
+  }
+
+  /* ---------------------------------------------------------- render: cloud mode */
+  if (srvMode === 'cloud') {
+    /* ---- cloud dropzone (settings apply at cut time — one-shot flow) ---- */
+    if (!cloud) {
+      return (
+        <div className="h-dvh flex flex-col bg-white">
+          <Header hasJob={false} onNew={newVideo} />
+          <main className="flex-1 grid place-items-center p-6">
+            <div className="w-full max-w-lg -mt-10">
+              <div className="text-center mb-8">
+                <div className="inline-grid place-items-center w-20 h-20 rounded-3xl bg-orange-500 shadow-lg shadow-orange-500/25 mb-5">
+                  <Scissors className="w-10 h-10 text-white" strokeWidth={2.2} />
+                </div>
+                <h1 className="text-4xl font-black tracking-tight">قصّاص الصمت</h1>
+                <p className="text-zinc-500 mt-2 text-lg">ارفع فيديو — هنشيل الصمت ونرجّعهولك بأقصى سرعة</p>
+                <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-orange-200 bg-orange-50 px-4 py-1.5 text-xs font-bold text-orange-700">
+                  <Cloud className="w-3.5 h-3.5" />
+                  وضع السحابة — الفيديو بيترفع مباشر من متصفحك على سيرفرات GoFile
+                </div>
+              </div>
+
+              {!cloudCutOK && (
+                <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>الاستضافة دي بتدعم الرفع والتخزين على GoFile، لكن القص نفسه مش متفعّل هنا — للقص الكامل شغّل النسخة المجانية من Colab أو Codespaces.</span>
+                </div>
+              )}
+
+              <label
+                className="group flex flex-col items-center gap-3 rounded-3xl border-2 border-dashed border-zinc-300 bg-zinc-50/60 px-8 py-14 cursor-pointer transition hover:border-orange-400 hover:bg-orange-50/40"
+                onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('border-orange-400', 'bg-orange-50/40') }}
+                onDragLeave={(e) => { e.stopPropagation(); e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40') }}
+                onDrop={(e) => {
+                  e.preventDefault(); e.stopPropagation()
+                  e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40')
+                  setDragOver(false)
+                  const f = e.dataTransfer.files?.[0]
+                  if (f) handleFilePick(f)
+                }}
+              >
+                <input type="file" accept="video/*" className="sr-only"
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFilePick(f) }} />
+                <div className="grid place-items-center w-14 h-14 rounded-2xl bg-orange-500/10 transition group-hover:bg-orange-500/20">
+                  <Upload className="w-7 h-7 text-orange-500" />
+                </div>
+                <div className="text-center">
+                  <div className="font-bold text-lg">اسحب الفيديو هنا أو اضغط للاختيار</div>
+                  <div className="text-sm text-zinc-500 mt-1">أي صيغة فيديو فيها صوت — MP4 وMOV وMKV وWEBM</div>
+                  <div className="text-xs text-zinc-400 mt-2">تقدر كمان تلزقه من الحافظة (Ctrl+V) أو تسحبه في أي حتة في الصفحة</div>
+                </div>
+              </label>
+
+              <div className="mt-5 rounded-2xl border border-zinc-200 p-4 space-y-4">
+                <h2 className="font-black text-sm">إعدادات القص <span className="font-normal text-zinc-400">(هتتطبق بعد الرفع)</span></h2>
+                <CutSettings gapMs={gapMs} thr={thr} crf={crf} onGap={setGapMs} onThr={setThr} onCrf={setCrf} />
+                <p className="text-xs text-zinc-400 leading-relaxed">
+                  المسار السحابي بياخد لحد {cloudMaxMB} م.ب وبيشتغل على أي استضافة حتى اللي من غير تخزين. للفيديوهات الأكبر{' '}
+                  <a className="text-orange-600 font-bold underline underline-offset-2" href="https://codespaces.new/mrmoneimofficial-del/autocut" target="_blank" rel="noopener">شغّل نسخة كاملة مجانًا</a>.
+                </p>
+              </div>
+            </div>
+          </main>
+          {dragOver && !cloud && (
+            <div className="fixed inset-0 z-50 pointer-events-none p-4">
+              <div className="h-full w-full rounded-3xl border-4 border-dashed border-orange-400 bg-orange-50/80 backdrop-blur-[2px] grid place-items-center">
+                <div className="text-center">
+                  <Upload className="w-14 h-14 text-orange-500 mx-auto mb-3" />
+                  <div className="text-2xl font-black text-orange-600">سيب الفيديو في أي مكان</div>
+                  <div className="text-sm text-orange-500 mt-1">هنبدأ الرفع فورًا</div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    /* ---- cloud: uploading straight to GoFile ---- */
+    if (cloud.phase === 'uploading') {
+      const pct = cloud.file?.size ? Math.min(100, (cloud.sent / cloud.file.size) * 100) : 0
+      const eta = cloud.speed > 0.05 && cloud.file ? (cloud.file.size - cloud.sent) / 1024 / 1024 / cloud.speed : null
+      return (
+        <div className="h-dvh flex flex-col bg-white">
+          <Header hasJob onNew={newVideo} />
+          <main className="flex-1 grid place-items-center p-6">
+            <div className="w-full max-w-lg -mt-10 rounded-3xl border border-zinc-200 p-8 shadow-sm">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="grid place-items-center w-12 h-12 rounded-2xl bg-orange-500/10">
+                  <Cloud className="w-6 h-6 text-orange-500" />
+                </div>
+                <div className="min-w-0">
+                  <div className="font-bold truncate">{cloud.file?.name}</div>
+                  <div className="text-sm text-zinc-500">{fmtMB(cloud.file?.size || 0)} — رفع مباشر على GoFile</div>
+                </div>
+              </div>
+              <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
+                <div className="h-full rounded-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="mt-3 flex justify-between text-sm text-zinc-500">
+                <span className="font-bold text-zinc-900">{pct.toFixed(0)}%</span>
+                <span>{cloud.speed > 0.05 ? `${cloud.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>
+              </div>
+              <div className="mt-2 text-xs text-zinc-400 leading-relaxed">
+                الفيديو بيتنقل من متصفحك لسيرفرات GoFile مباشرة — مش بيمر على استضافة قصّاص، فمفيش قيود رفع هنا.
+              </div>
+              <div className="mt-5 flex items-center gap-2">
+                <button onClick={cancelCloud}
+                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-500 transition hover:border-red-200 hover:text-red-600">
+                  <X className="w-4 h-4" /> إلغاء
+                </button>
+                <span className="text-[11px] text-zinc-400">{fmtMB(cloud.sent)} من {fmtMB(cloud.file?.size || 0)}</span>
+              </div>
+            </div>
+          </main>
+        </div>
+      )
+    }
+
+    /* ---- cloud: cutting (streamed stages) ---- */
+    if (cloud.phase === 'cutting') {
+      const cut = cloud.cut || { stage: 'prep', pct: 0 }
+      return (
+        <div className="h-dvh flex flex-col bg-white">
+          <Header hasJob onNew={newVideo} />
+          <main className="flex-1 grid place-items-center p-6">
+            <div className="w-full max-w-lg -mt-10 rounded-3xl border border-zinc-200 p-8 shadow-sm">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="grid place-items-center w-12 h-12 rounded-2xl bg-green-50">
+                  <CheckCircle2 className="w-6 h-6 text-green-600" />
+                </div>
+                <div className="min-w-0">
+                  <div className="font-bold truncate">{cloud.ref?.name || cloud.file?.name}</div>
+                  <div className="text-sm text-zinc-500">اترفع على GoFile ✓ — دلوقتي بنقصّ الصمت</div>
+                </div>
+              </div>
+              {cloud.ref?.downloadPage && (
+                <a href={cloud.ref.downloadPage} target="_blank" rel="noopener"
+                  className="mb-5 flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 h-9 text-xs font-bold text-zinc-600 hover:border-orange-300 hover:text-orange-600 transition">
+                  <ExternalLink className="w-3.5 h-3.5" /> الفيديو الأصلي محفوظ على GoFile — اللينك شغال من دلوقتي
+                </a>
+              )}
+              <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
+                <div className="h-full rounded-full bg-orange-500 transition-all duration-500" style={{ width: `${Math.max(2, cut.pct)}%` }} />
+              </div>
+              <div className="mt-3 flex justify-between text-sm text-zinc-500">
+                <span className="flex items-center gap-2 font-bold text-zinc-900">
+                  {cut.stage === 'download' ? <Download className="w-4 h-4 text-orange-500" /> : <Zap className="w-4 h-4 text-orange-500" />}
+                  {cut.text || 'بنقصّ الفيديو…'}
+                </span>
+                <span className="tabular-nums font-bold text-orange-700">{cut.pct}%</span>
+              </div>
+              {(cut.speedX || cut.etaSec) && (
+                <div className="mt-2 flex justify-between text-xs text-zinc-400 tabular-nums font-semibold">
+                  {cut.speedX ? <span>السرعة: {cut.speedX}× الوقت الحقيقي</span> : <span />}
+                  {cut.etaSec ? <span>باقي ~{fmtETA(cut.etaSec)}</span> : <span />}
+                </div>
+              )}
+              <div className="mt-5 flex items-center gap-2">
+                <button onClick={cancelCloud}
+                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-500 transition hover:border-red-200 hover:text-red-600">
+                  <X className="w-4 h-4" /> إلغاء المعالجة
+                </button>
+              </div>
+            </div>
+          </main>
+        </div>
+      )
+    }
+
+    /* ---- cloud: done (results) ---- */
+    if (cloud.phase === 'done') {
+      const r = cloud.result
+      const plan = r?.plan
+      const outDur = r?.output?.durationMs ?? plan?.keptMs
+      return (
+        <div className="h-dvh flex flex-col bg-white">
+          <Header hasJob onNew={newVideo} />
+          <main className="flex-1 grid place-items-center p-6 overflow-y-auto">
+            <div className="w-full max-w-lg -mt-6 space-y-5 py-6">
+              <div className="text-center">
+                <div className="inline-grid place-items-center w-16 h-16 rounded-3xl bg-green-50 mb-4">
+                  <CheckCircle2 className="w-8 h-8 text-green-600" />
+                </div>
+                <h1 className="text-3xl font-black">تم القص 🎉</h1>
+                {r?.meta && (
+                  <p className="text-zinc-500 mt-1 text-sm">
+                    {r.meta.width}×{r.meta.height} — الأصل {fmtTime(plan?.durationMs || r.meta.durationMs)}
+                  </p>
+                )}
+              </div>
+
+              {r?.resultUrl ? (
+                <a href={r.resultUrl} target="_blank" rel="noopener"
+                  className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5">
+                  <Download className="w-5 h-5" />
+                  افتح النتيجة على GoFile
+                </a>
+              ) : (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  القص خلص بس حفظ النتيجة على GoFile مش متاح من هنا دلوقتي — جرّب تاني أو استخدم النسخة الكاملة.
+                </div>
+              )}
+
+              {r?.original && (
+                <a href={r.original} target="_blank" rel="noopener"
+                  className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm">
+                  <ExternalLink className="w-4 h-4" /> الفيديو الأصلي على GoFile
+                </a>
+              )}
+
+              {plan && (
+                <section className="rounded-2xl border border-zinc-200 overflow-hidden">
+                  <div className="px-4 pt-4 pb-2 font-black text-sm text-zinc-900">النتيجة</div>
+                  <div className="px-4 pb-4 space-y-2.5 text-sm">
+                    <Row label="المدة الأصلية" value={fmtTime(plan.durationMs)} />
+                    <Row label="المدة بعد القص" value={fmtTime(outDur || plan.keptMs)} />
+                    <Row label="فجوات اتشالت" value={String(plan.cutsCount).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[+d])} />
+                    <div className="flex items-center justify-between pt-2.5 border-t border-zinc-100">
+                      <span className="text-zinc-500">التوفير</span>
+                      <span className="font-black text-orange-600 text-lg tabular-nums">
+                        {fmtTime(plan.savedMs)} <span className="text-sm">({Math.round((plan.savedMs / Math.max(1, plan.durationMs)) * 100)}%)</span>
+                      </span>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {cloud.ref && (
+                <details className="rounded-2xl border border-zinc-200 p-4">
+                  <summary className="cursor-pointer text-sm font-black">جرّب إعدادات تانية؟ (من غير إعادة رفع)</summary>
+                  <div className="mt-4 space-y-4">
+                    <CutSettings gapMs={gapMs} thr={thr} crf={crf} onGap={setGapMs} onThr={setThr} onCrf={setCrf} />
+                    <button onClick={() => runCloudCut(cloud.ref!)}
+                      className="w-full h-12 rounded-2xl bg-orange-500 hover:bg-orange-600 text-white font-bold transition flex items-center justify-center gap-2">
+                      <Zap className="w-4 h-4" /> قصّه تاني بالإعدادات الجديدة
+                    </button>
+                  </div>
+                </details>
+              )}
+
+              <p className="text-center text-[11px] text-zinc-400 leading-relaxed">
+                الملفات على GoFile — اللينك بيعيش مع آخر تحميل منه (GoFile بيمسح الملفات غير النشطة تلقائيًا).
+              </p>
+
+              <button onClick={newVideo}
+                className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2 text-sm">
+                <Upload className="w-4 h-4" /> فيديو جديد
+              </button>
+            </div>
+          </main>
+        </div>
+      )
+    }
+
+    /* ---- cloud: error ---- */
+    return (
+      <div className="h-dvh flex flex-col bg-white">
+        <Header hasJob onNew={newVideo} />
+        <main className="flex-1 grid place-items-center p-6">
+          <div className="w-full max-w-lg -mt-10 rounded-3xl border border-red-200 bg-red-50/50 p-8 shadow-sm">
+            <div className="flex items-center gap-4 mb-5">
+              <div className="grid place-items-center w-12 h-12 rounded-2xl bg-red-100">
+                <AlertTriangle className="w-6 h-6 text-red-600" />
+              </div>
+              <div className="font-black text-lg">حصل خطأ</div>
+            </div>
+            <p className="text-sm text-red-700 leading-relaxed">{cloud.error || 'خطأ غير معروف'}</p>
+            <div className="mt-5 flex flex-wrap items-center gap-2">
+              {cloud.retryUpload && cloud.file && (
+                <button onClick={() => startCloudUpload(cloud.file!)}
+                  className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
+                  <RefreshCw className="w-4 h-4" /> إعادة الرفع
+                </button>
+              )}
+              {!cloud.retryUpload && cloud.ref && (
+                <button onClick={() => runCloudCut(cloud.ref!)}
+                  className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
+                  <RefreshCw className="w-4 h-4" /> إعادة محاولة القص
+                </button>
+              )}
+              <button onClick={newVideo}
+                className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-700 transition hover:border-orange-300">
+                فيديو جديد
+              </button>
+            </div>
+            <div className="mt-5 pt-4 border-t border-red-100">
+              <p className="text-xs text-red-600 leading-relaxed mb-2">الفيلم كبير أو الاستضافة بطيئة؟ النسخة الكاملة المجانية بتاخد أي حجم:</p>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <a href="https://colab.research.google.com/github/mrmoneimofficial-del/autocut/blob/main/colab.ipynb"
+                  target="_blank" rel="noopener"
+                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-500 px-3.5 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-orange-600">
+                  <Rocket className="w-3.5 h-3.5" /> Google Colab
+                </a>
+                <a href="https://codespaces.new/mrmoneimofficial-del/autocut"
+                  target="_blank" rel="noopener"
+                  className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-3.5 py-2 text-xs font-bold text-zinc-700 shadow-sm transition hover:border-orange-300">
+                  <Github className="w-3.5 h-3.5" /> GitHub Codespaces
+                </a>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    )
   }
 
   /* ---------------------------------------------------------- render: upload screen */
@@ -571,11 +1100,11 @@ export default function Home() {
                 e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40')
                 setDragOver(false)
                 const f = e.dataTransfer.files?.[0]
-                if (f) startUpload(f)
+                if (f) handleFilePick(f)
               }}
             >
               <input type="file" accept="video/*" className="sr-only"
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) startUpload(f) }} />
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFilePick(f) }} />
               <div className="grid place-items-center w-14 h-14 rounded-2xl bg-orange-500/10 transition group-hover:bg-orange-500/20">
                 <Upload className="w-7 h-7 text-orange-500" />
               </div>
@@ -1041,6 +1570,38 @@ function Setting({ label, hint, children }: { label: string; hint?: string; chil
       {children}
       {hint && <span className="block text-xs text-zinc-400">{hint}</span>}
     </label>
+  )
+}
+
+/** compact 3-select settings card — shared by cloud dropzone + cloud re-cut */
+function CutSettings({ gapMs, thr, crf, onGap, onThr, onCrf }: {
+  gapMs: number; thr: number; crf: number
+  onGap: (v: number) => void; onThr: (v: number) => void; onCrf: (v: number) => void
+}) {
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <Setting label="الفجوة بين الكلام">
+        <select value={gapMs} onChange={(e) => onGap(+e.target.value)} className={selCls}>
+          <option value={100}>0.1 ثانية</option>
+          <option value={200}>0.2 ثانية</option>
+          <option value={300}>0.3 ثانية</option>
+        </select>
+      </Setting>
+      <Setting label="حساسية الكشف">
+        <select value={thr} onChange={(e) => onThr(+e.target.value)} className={selCls}>
+          <option value={-40}>ناعمة</option>
+          <option value={-35}>متوازنة</option>
+          <option value={-30}>خفيفة</option>
+        </select>
+      </Setting>
+      <Setting label="الجودة">
+        <select value={crf} onChange={(e) => onCrf(+e.target.value)} className={selCls}>
+          <option value={28}>عالية</option>
+          <option value={32}>متوازنة</option>
+          <option value={36}>أصغر حجمًا</option>
+        </select>
+      </Setting>
+    </div>
   )
 }
 
