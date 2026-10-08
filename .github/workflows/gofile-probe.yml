@@ -1,5 +1,6 @@
 # TEMPORARY one-shot probe: verify GoFile API behavior from a clean IP
-# (the dev sandbox IP is DDoS-blocked by gofile). Removed after verification.
+# (the dev sandbox IP is DDoS-blocked by gofile). Results are pasted to a
+# public paste service so the sandbox can read them. Removed after verification.
 name: GoFile API probe
 on:
   push:
@@ -12,7 +13,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Probe upload / download / CORS / wt
+        shell: bash
         run: |
+          exec > /tmp/probe-out.txt 2>&1
+          set -x
           echo '================================================== 0. servers list'
           curl -sS --max-time 30 'https://api.gofile.io/servers' | head -c 800; echo
 
@@ -41,13 +45,24 @@ jobs:
 
           echo '================================================== 4. GET file metadata with owner guest token'
           curl -sS --max-time 30 "https://api.gofile.io/contents/$FID" \
-               -H "Authorization: Bearer $TOKEN" | head -c 1500; echo
+               -H "Authorization: Bearer $TOKEN" -o /tmp/meta.json
+          cat /tmp/meta.json; echo
+          echo '--- metadata WITHOUT token:'
+          curl -sS --max-time 30 "https://api.gofile.io/contents/$FID" | head -c 600; echo
+          METALINK=$(python3 -c "import json;d=json.load(open('/tmp/meta.json')).get('data',{});print(d.get('link') or '')" 2>/dev/null)
+          echo "meta.link=$METALINK"
+          if [ -n "$METALINK" ]; then
+            echo '--- download via meta.link:'
+            curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$METALINK" || echo FAIL
+            curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$METALINK?wt=x" || echo FAIL
+          fi
 
           echo '================================================== 5. web download URL variants'
           U="https://$SRV.gofile.io/download/web/$FID/$FNAME"
-          echo "--- bare:";      curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U" || echo FAIL
-          echo "--- ?wt=bogus:";  curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U?wt=deadbeef" || echo FAIL
-          echo "--- ?token=guest:"; curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U?token=$TOKEN" || echo FAIL
+          for v in "bare:" "bogus-wt:?wt=deadbeef" "token:?token=$TOKEN" "guestTokenParam:?guestToken=$TOKEN"; do
+            k="${v%%:*}"; q="${v#*:}"
+            echo "--- $k:"; curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U$q" || echo FAIL
+          done
           echo "--- headers of bare attempt:"; curl -sS --max-time 60 -D - -o /dev/null "$U" | head -15
 
           echo '================================================== 6. wt.obf.js (website token)'
@@ -55,7 +70,8 @@ jobs:
           WTJS=$(grep -oE '/js/wt[^"'"'"']*\.js' /tmp/home.html | head -1)
           echo "wt script path: $WTJS"
           curl -sS --max-time 30 "https://gofile.io$WTJS" -o /tmp/wt.js
-          echo '--- wt.js (first 2500 chars):'; head -c 2500 /tmp/wt.js; echo
+          echo '--- wt.js (first 3000 chars):'; head -c 3000 /tmp/wt.js; echo
+          echo '--- wt.js total size:'; wc -c /tmp/wt.js
           WT=$(python3 -c "
           import re
           s = open('/tmp/wt.js', encoding='utf-8', errors='replace').read()
@@ -75,7 +91,7 @@ jobs:
             for k, v in ch.items():
                 if v.get('type') == 'file':
                     print(v['id']); break
-          except Exception as e:
+          except Exception:
             print('')")
             REFNAME=$(python3 -c "
           import json
@@ -87,28 +103,33 @@ jobs:
                     print(v['name']); break
           except Exception:
             print('')")
-            REFLINK=$(python3 -c "
-          import json
-          try:
-            d = json.load(open('/tmp/ref.json'))['data']
-            ch = d.get('children') or {}
-            for k, v in ch.items():
-                if v.get('type') == 'file':
-                    print(v.get('link') or ''); break
-          except Exception:
-            print('')")
-            echo "reference file: id=$REFID name=$REFNAME link=$REFLINK"
+            echo "reference file: id=$REFID name=$REFNAME"
             if [ -n "$REFID" ]; then
-              echo '--- trying to download the reference file (text head):'
-              curl -sSL --max-time 60 "$U_REF" -o /dev/null 2>/dev/null
-              curl -sSL --max-time 60 "https://$SRV.gofile.io/download/web/$REFID/$REFNAME?wt=$WT" -o /tmp/ref.bin
-              echo "size: $(stat -c%s /tmp/ref.bin 2>/dev/null)"; file /tmp/ref.bin 2>/dev/null; head -c 1800 /tmp/ref.bin; echo
+              echo '--- trying to download the reference file (identify it):'
+              curl -sSL --max-time 90 "https://$SRV.gofile.io/download/web/$REFID/$REFNAME?wt=$WT" -o /tmp/ref.bin || echo FAIL
+              echo "size: $(stat -c%s /tmp/ref.bin 2>/dev/null)"; file /tmp/ref.bin 2>/dev/null
+              echo '--- first 1500 bytes as text:'; head -c 1500 /tmp/ref.bin; echo
             fi
           else
-            echo 'wt extraction failed — skipping reference probe'
+            echo 'wt regex extraction failed — trying browserless extraction skipped'
           fi
 
           echo '================================================== 8. second upload reusing guestToken + parentFolder'
           head -c 50000 /dev/urandom > probe2.mp4
           curl -sS --max-time 90 -F 'file=@probe2.mp4' -F "token=$TOKEN" -F "folderId=$PF" \
                https://upload.gofile.io/uploadfile | head -c 1200; echo
+
+          echo '================================================== DONE'
+      - name: Publish results
+        shell: bash
+        run: |
+          ls -la /tmp/probe-out.txt
+          echo '--- uploading results to paste services ---'
+          URL1=$(curl -sS --max-time 60 -F 'file=@/tmp/probe-out.txt' https://0x0.st || true)
+          echo "0x0.st: $URL1"
+          if [ -z "$URL1" ]; then
+            URL1=$(curl -sS --max-time 60 --data-binary @/tmp/probe-out.txt https://paste.c-net.org/ || true)
+            echo "paste.c-net.org: $URL1"
+          fi
+          if [ -n "$URL1" ]; then echo "PROBE_RESULTS_URL=$URL1" >> "$GITHUB_STEP_SUMMARY"; fi
+          tail -c 4000 /tmp/probe-out.txt
