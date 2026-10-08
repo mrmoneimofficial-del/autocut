@@ -1,13 +1,16 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
   AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket, Github,
-  X, Cloud,
+  X, Cloud, AudioLines,
 } from 'lucide-react'
 import { useUpload } from '@/hooks/use-upload'
 import { UploadProgressCard } from '@/components/upload-progress-card'
+import { WaveformPanel } from '@/components/waveform-panel'
+import { DownloadButton } from '@/components/download-button'
+import { buildCuts, detectCuts, makeCutId, parseWave, smartSuggestions, waveWithoutCuts, type CutObj, type WaveData } from '@/lib/waveform'
 import type { ChunkProgress, ChunkedUploadHandle } from '@/lib/chunked-upload'
 import { formatBytes as fmtBytesCard } from '@/lib/chunked-upload'
 
@@ -69,69 +72,8 @@ const fmtETA = (sec: number) => {
 }
 
 /* --------------------------------------------------------------- timeline */
-function Timeline({ durationMs, cuts, playheadRef, onSeek, active }: {
-  durationMs: number
-  cuts: Cut[]
-  playheadRef: React.RefObject<HTMLDivElement | null>
-  onSeek: (ms: number) => void
-  active: boolean
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const wrapRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const cv = canvasRef.current, wrap = wrapRef.current
-    if (!cv || !wrap || !durationMs) return
-    const draw = () => {
-      const w = wrap.clientWidth, h = wrap.clientHeight
-      const dpr = window.devicePixelRatio || 1
-      cv.width = w * dpr; cv.height = h * dpr
-      const ctx = cv.getContext('2d')!
-      ctx.scale(dpr, dpr)
-      ctx.fillStyle = '#fafafa'
-      ctx.fillRect(0, 0, w, h)
-      // kept speech blocks
-      ctx.fillStyle = '#e4e4e7'
-      let cur = 0
-      for (const [s, e] of cuts) {
-        const a = (cur / durationMs) * w, b = (s / durationMs) * w
-        if (b > a) ctx.fillRect(a, h * 0.28, b - a, h * 0.44)
-        cur = e
-      }
-      if (durationMs > cur) ctx.fillRect((cur / durationMs) * w, h * 0.28, w - (cur / durationMs) * w, h * 0.44)
-      // removed silences (orange)
-      ctx.fillStyle = '#f97316'
-      for (const [s, e] of cuts) {
-        const a = (s / durationMs) * w, b = (e / durationMs) * w
-        ctx.fillRect(a, 0, Math.max(1.2, b - a), h)
-      }
-    }
-    draw()
-    const ro = new ResizeObserver(draw)
-    ro.observe(wrap)
-    return () => ro.disconnect()
-  }, [cuts, durationMs])
-
-  const seekAt = (clientX: number) => {
-    const el = wrapRef.current
-    if (!el || !durationMs) return
-    const r = el.getBoundingClientRect()
-    const pct = Math.min(1, Math.max(0, (clientX - r.left) / r.width))
-    onSeek(pct * durationMs)
-  }
-
-  return (
-    <div
-      ref={wrapRef}
-      dir="ltr"
-      className={`relative h-11 rounded-xl border border-zinc-200 bg-zinc-50 overflow-hidden ${active ? 'cursor-pointer' : 'opacity-60'}`}
-      onClick={(e) => active && seekAt(e.clientX)}
-    >
-      <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
-      <div ref={playheadRef} className="absolute top-0 bottom-0 w-[2px] bg-zinc-900 rounded-full hidden" />
-    </div>
-  )
-}
+/* (the visual timeline now lives in <WaveformPanel/> — a big interactive
+ *   waveform with zoom + draggable cut boundaries + a time ruler) */
 
 /* ------------------------------------------------------------ main app */
 export default function Home() {
@@ -143,6 +85,11 @@ export default function Home() {
   const [gapMs, setGapMs] = useState(200)
   const [thr, setThr] = useState(-35)
   const [crf, setCrf] = useState(32)
+  const [minSil, setMinSil] = useState(500)
+  /* live montage: audio envelope + instantly recomputed cut list */
+  const [wave, setWave] = useState<WaveData | null>(null)
+  const [waveErr, setWaveErr] = useState(false)
+  const [cuts, setCuts] = useState<CutObj[]>([])
   /* cloud mode */
   const [srvMode, setSrvMode] = useState<'server' | 'cloud' | null>(null)
   const [cloudCutOK, setCloudCutOK] = useState(true)
@@ -161,8 +108,8 @@ export default function Home() {
   } = useUpload()
 
   const videoRef = useRef<HTMLVideoElement>(null)
-  const playheadRef = useRef<HTMLDivElement>(null)
   const cutsRef = useRef<Cut[]>([])
+  const cutsObjRef = useRef<CutObj[]>([])
   const skipRef = useRef(true)
   const viewRef = useRef<'src' | 'out'>('src')
   const cloudAbort = useRef<AbortController | null>(null)
@@ -181,7 +128,68 @@ export default function Home() {
 
   useEffect(() => { skipRef.current = skip }, [skip])
   useEffect(() => { viewRef.current = view }, [view])
-  useEffect(() => { if (job?.plan) cutsRef.current = job.plan.cuts }, [job?.plan])
+
+  /* stable identity for effects (job objects are re-created every poll) */
+  const jobId = job?.id
+  const jobPhase = job?.phase
+  const jobMeta = job?.meta
+  const jobMetaDur = job?.meta?.durationMs ?? 0
+  /* live cuts → the smart-skip playback list (original timeline, active only) */
+  useEffect(() => {
+    cutsObjRef.current = cuts
+    cutsRef.current = cuts.filter((c) => c.active).map((c) => [c.start, c.end] as Cut)
+  }, [cuts])
+
+  /* fetch the audio envelope once per job — powers the waveform + instant detection.
+   * deps are the id/phase (NOT the job object) so polling never cancels an in-flight fetch */
+  useEffect(() => {
+    if (srvMode === 'cloud') return
+    if (!jobId || jobPhase === 'uploaded' || jobPhase === 'analyzing') return
+    if (wave || waveErr) return
+    let alive = true
+    ;(async () => {
+      try {
+        const r = await fetch(`/api/jobs/${jobId}/wave`, { cache: 'no-store' })
+        if (!r.ok) throw new Error('wave failed')
+        const w = parseWave(await r.json())
+        if (!w || w.n < 2) throw new Error('empty wave')
+        if (alive) setWave(w)
+      } catch {
+        if (alive) setWaveErr(true)
+      }
+    })()
+    return () => { alive = false }
+  }, [jobId, jobPhase, srvMode, wave, waveErr])
+
+  /* reset the montage state when the job itself changes */
+  useEffect(() => {
+    setWave(null)
+    setWaveErr(false)
+    setCuts([])
+    cutsObjRef.current = []
+  }, [job?.id])
+
+  /* before the envelope arrives: show the server-side plan cuts (still draggable) */
+  useEffect(() => {
+    if (wave || waveErr) return
+    const pc = job?.plan?.cuts
+    if (pc?.length && cutsObjRef.current.length === 0) {
+      const init: CutObj[] = pc.map(([s, e]) => ({ id: makeCutId(), start: s, end: e, pinned: false, active: true }))
+      cutsObjRef.current = init
+      setCuts(init)
+    }
+  }, [job?.plan, wave, waveErr])
+
+  /* INSTANT re-detection — every option change re-cuts the envelope in ~0ms;
+   * manually pinned cuts (dragged handles / excluded gaps) survive untouched */
+  useEffect(() => {
+    if (!wave || !jobMetaDur) return
+    const auto = detectCuts(wave, { thresholdDb: thr, gapMs, minSilenceMs: minSil })
+    const pinned = cutsObjRef.current.filter((c) => c.pinned)
+    const next = buildCuts(auto, pinned)
+    cutsObjRef.current = next
+    setCuts(next)
+  }, [wave, thr, gapMs, minSil, jobMetaDur])
 
   /* remember the last terminal error the uploader reported (the hook clears
      its progress state once the promise settles — the page needs the message) */
@@ -274,6 +282,31 @@ export default function Home() {
     const t = setInterval(() => refresh(job.id), active ? 1200 : 5000)
     return () => clearInterval(t)
   }, [job, refresh])
+
+  /* --------------------------------------------- live montage derivatives */
+  /** stats computed from the LIVE cut list — updates the same instant any
+   *  slider moves or a boundary is dragged (المتوقَّع = المقطوع بالظبط) */
+  const liveStats = useMemo(() => {
+    if (!jobMetaDur) return null
+    const active = cuts.filter((c) => c.active)
+    const saved = active.reduce((n, c) => n + (c.end - c.start), 0)
+    return {
+      durationMs: jobMetaDur,
+      keptMs: Math.max(0, jobMetaDur - saved),
+      savedMs: saved,
+      cutsCount: active.length,
+    }
+  }, [cuts, jobMetaDur])
+
+  /** smart dB suggestions derived from THIS video's measured levels */
+  const sugs = useMemo(() => smartSuggestions(wave?.stats ?? null), [wave?.stats])
+
+  /** the RESULT timeline's envelope (source minus active cuts) — shown while
+   *  previewing the output so the waveform matches what you'll download */
+  const outWave = useMemo(
+    () => (view === 'out' && wave ? waveWithoutCuts(wave, cuts) : null),
+    [view, wave, cuts],
+  )
 
   /* --------------------------------------------- cloud mode: streamed cut */
   /** POST /api/cloud/cut and consume its NDJSON event stream */
@@ -433,12 +466,16 @@ export default function Home() {
 
   const startRender = useCallback(async () => {
     if (!job) return
+    // send the EXPLICIT montage plan — the render matches the live preview 1:1
     await fetch(`/api/jobs/${job.id}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'render', gapMs, thresholdDb: thr, crf }),
+      body: JSON.stringify({
+        action: 'render', crf, gapMs, thresholdDb: thr,
+        cuts: cuts.filter((c) => c.active).map((c) => [c.start, c.end]),
+      }),
     })
     refresh(job.id)
-  }, [job, gapMs, thr, crf, refresh])
+  }, [job, gapMs, thr, crf, cuts, refresh])
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
@@ -446,6 +483,7 @@ export default function Home() {
     cloudAbort.current?.abort()
     setJob(null); setJobErr(null); setView('src'); setSkip(true)
     setCloud(null); setRetryFile(null)
+    setWave(null); setWaveErr(false); setCuts([]); cutsObjRef.current = []
   }
 
   /* smart input #1 — paste a video straight from the clipboard (Ctrl+V) */
@@ -507,28 +545,7 @@ export default function Home() {
     }
   }, [])
 
-  useEffect(() => {
-    let raf = 0
-    const tick = () => {
-      const v = videoRef.current, ph = playheadRef.current
-      if (v && ph && job) {
-        const dur = view === 'out' ? (job.output?.durationMs ?? v.duration * 1000) : (job.plan?.durationMs ?? v.duration * 1000)
-        if (dur && isFinite(dur) && dur > 0) {
-          const pct = Math.min(100, (v.currentTime * 1000 / dur) * 100)
-          ph.style.left = `${pct}%`
-          ph.classList.remove('hidden')
-        }
-      }
-      raf = requestAnimationFrame(tick)
-    }
-    raf = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(raf)
-  }, [job, view])
-
-  const seekTo = (ms: number) => {
-    const v = videoRef.current
-    if (v) v.currentTime = ms / 1000
-  }
+  /* the WaveformPanel owns its playhead (it knows the zoom window) */
 
   /* ---------------------------------------------------------- render: cloud mode */
   if (srvMode === 'cloud') {
@@ -724,11 +741,13 @@ export default function Home() {
               </div>
 
               {r?.resultUrl ? (
-                <a href={r.resultUrl} target="_blank" rel="noopener"
-                  className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5">
-                  <Download className="w-5 h-5" />
-                  نزّل النتيجة (رابط دائم)
-                </a>
+                <DownloadButton
+                  url={r.resultUrl}
+                  fileName="قصّاص-النتيجة.mp4"
+                  size={Number(r?.output?.size || 0)}
+                  label="نزّل النتيجة (رابط دائم)"
+                  hint="تحميل متسارع بمسارات متوازية بيقيس السرعة لحظيًا — والرابط بيعيش أسبوع"
+                />
               ) : (
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
                   القص خلص بس حفظ النتيجة على التخزين السحابي حصل فيه مشكلة — جرّب تقصّه تاني أو استخدم النسخة الكاملة.
@@ -944,8 +963,11 @@ export default function Home() {
   const plan = job!.plan
   const prog = job!.progress
   const isResult = view === 'out' && (phase === 'done' || phase === 'mirroring')
-  const playingDuration = isResult ? job!.output?.durationMs : plan?.durationMs
-  const statsChanged = plan && (plan.settings.gapMs !== gapMs || plan.settings.thresholdDb !== thr)
+  const busy = phase === 'rendering' || phase === 'mirroring'
+  /* live numbers when the envelope is in (instant!), server plan otherwise */
+  const s = liveStats ?? (plan ? { durationMs: plan.durationMs, keptMs: plan.keptMs, savedMs: plan.savedMs, cutsCount: plan.cutsCount } : null)
+  const outDurMs = job!.output?.durationMs ?? job!.meta?.durationMs ?? 1
+  const srcDurMs = job!.meta?.durationMs ?? job!.plan?.durationMs ?? 1
 
   return (
     <div className="h-dvh flex flex-col bg-white">
@@ -962,7 +984,7 @@ export default function Home() {
                   <SegBtn active={view === 'out'} onClick={() => setView('out')}>النتيجة</SegBtn>
                 </div>
               )}
-              {view === 'src' && phase !== 'analyzing' && plan && plan.cutsCount > 0 && (
+              {view === 'src' && phase !== 'analyzing' && (s?.cutsCount ?? 0) > 0 && (
                 <button
                   onClick={() => setSkip((s) => !s)}
                   className={`inline-flex items-center gap-2 rounded-xl border px-3 h-9 text-sm font-bold transition ${skip ? 'border-orange-500 bg-orange-500 text-white' : 'border-zinc-200 bg-white text-zinc-600 hover:border-orange-300'}`}
@@ -986,7 +1008,7 @@ export default function Home() {
               )}
             </div>
             <div className="text-sm text-zinc-500 tabular-nums font-semibold" id="timelabel">
-              {isResult ? 'النتيجة النهائية' : plan ? `المدة بعد القص: ${fmtTime(plan.keptMs)}` : meta ? fmtTime(meta.durationMs) : '…'}
+              {isResult ? 'النتيجة النهائية' : s ? `المدة بعد القص: ${fmtTime(s.keptMs)}` : meta ? fmtTime(meta.durationMs) : '…'}
             </div>
           </div>
 
@@ -1004,17 +1026,24 @@ export default function Home() {
             />
           </div>
 
-          <Timeline
-            durationMs={isResult ? (job!.output?.durationMs ?? 1) : (plan?.durationMs ?? meta?.durationMs ?? 1)}
-            cuts={isResult ? [] : (plan?.cuts ?? [])}
-            playheadRef={playheadRef}
-            onSeek={seekTo}
-            active={phase !== 'analyzing'}
+          <WaveformPanel
+            wave={isResult ? outWave : wave}
+            cuts={isResult ? [] : cuts}
+            onCutsChange={(next) => {
+              cutsObjRef.current = next
+              setCuts(next)
+            }}
+            onResetPins={() => {
+              if (!wave) return
+              const next = buildCuts(detectCuts(wave, { thresholdDb: thr, gapMs, minSilenceMs: minSil }), [])
+              cutsObjRef.current = next
+              setCuts(next)
+            }}
+            durMs={isResult ? outDurMs : srcDurMs}
+            videoRef={videoRef}
+            seekActive={phase !== 'analyzing'}
+            canEdit={(phase === 'ready' || phase === 'done') && !isResult}
           />
-          <div className="flex items-center justify-between text-xs text-zinc-400 px-1" dir="rtl">
-            <span className="flex items-center gap-1"><span className="w-3 h-2 rounded-sm bg-zinc-300 inline-block" /> الكلام</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-2 rounded-sm bg-orange-500 inline-block" /> صمت هيتشال</span>
-          </div>
         </section>
 
         {/* sidebar — renders on the LEFT in RTL (second child) */}
@@ -1064,50 +1093,122 @@ export default function Home() {
               </div>
             )}
 
-            {/* stats */}
-            {plan && phase !== 'analyzing' && (
+            {/* stats — LIVE: recomputed the same instant any slider moves */}
+            {s && phase !== 'analyzing' && (
               <section className="rounded-2xl border border-zinc-200 overflow-hidden">
                 <div className="px-4 pt-4 pb-2 flex items-center justify-between">
                   <h2 className="font-black text-sm text-zinc-900">النتيجة المتوقعة</h2>
-                  {(phase === 'done' || phase === 'mirroring') && <span className="inline-flex items-center gap-1 text-xs font-bold text-orange-600"><CheckCircle2 className="w-3.5 h-3.5" /> تم القص</span>}
+                  <div className="flex items-center gap-2">
+                    {liveStats && phase === 'ready' && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-orange-600 bg-orange-50 border border-orange-100 rounded-full px-2 py-0.5">
+                        <AudioLines className="w-3 h-3" /> لحظي
+                      </span>
+                    )}
+                    {(phase === 'done' || phase === 'mirroring') && <span className="inline-flex items-center gap-1 text-xs font-bold text-orange-600"><CheckCircle2 className="w-3.5 h-3.5" /> تم القص</span>}
+                  </div>
                 </div>
                 <div className="px-4 pb-4 space-y-2.5 text-sm">
-                  <Row label="المدة الأصلية" value={fmtTime(plan.durationMs)} />
-                  <Row label="المدة بعد القص" value={fmtTime((phase === 'done' || phase === 'mirroring') ? (job!.output?.durationMs ?? plan.keptMs) : plan.keptMs)} />
-                  <Row label="فجوات هتتشال" value={String(plan.cutsCount).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[+d])} />
+                  <Row label="المدة الأصلية" value={fmtTime(s.durationMs)} />
+                  <Row label="هيتقص (صمت)" value={fmtTime(s.savedMs)} />
+                  <Row label="هيتبقي (كلام)" value={fmtTime((phase === 'done' || phase === 'mirroring') ? (job!.output?.durationMs ?? s.keptMs) : s.keptMs)} />
+                  <Row label="فجوات هتتشال" value={String(s.cutsCount).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[+d])} />
                   <div className="flex items-center justify-between pt-2.5 border-t border-zinc-100">
                     <span className="text-zinc-500">التوفير</span>
                     <span className="font-black text-orange-600 text-lg tabular-nums">
-                      {fmtTime(plan.savedMs)} <span className="text-sm">({Math.round((plan.savedMs / Math.max(1, plan.durationMs)) * 100)}%)</span>
+                      {fmtTime(s.savedMs)} <span className="text-sm">({Math.round((s.savedMs / Math.max(1, s.durationMs)) * 100)}%)</span>
                     </span>
                   </div>
-                  {statsChanged && phase === 'ready' && (
-                    <p className="text-xs text-zinc-400 pt-1">غيّرت الإعدادات — هتتطبق وتتحدث الإحصائيات عند القص</p>
+                  {liveStats && (phase === 'ready' || phase === 'done') && (
+                    <p className="text-[11px] text-zinc-400 pt-0.5">الأرقام دي بتتحدث لحظيًا مع أي تغيير في الإعدادات أو المونتاج</p>
                   )}
                 </div>
               </section>
             )}
 
-            {/* settings */}
+            {/* settings — sliders with LIVE preview (every change re-cuts instantly) */}
             {(phase === 'ready' || phase === 'rendering' || phase === 'mirroring' || phase === 'done' || phase === 'error') && (
-              <section className={`rounded-2xl border p-4 space-y-4 ${(phase === 'rendering' || phase === 'mirroring') ? 'border-zinc-200 opacity-60' : 'border-zinc-200'}`}>
-                <h2 className="font-black text-sm">إعدادات القص</h2>
-                <Setting label="الفجوة المتبقية بين الكلام" hint="كل سكتة هيتساب منها قد إيه">
-                  <select value={gapMs} disabled={phase === 'rendering'} onChange={(e) => setGapMs(+e.target.value)} className={selCls}>
-                    <option value={100}>0.1 ثانية — سريع جدًا</option>
-                    <option value={200}>0.2 ثانية — طبيعي</option>
-                    <option value={300}>0.3 ثانية — مرتاح</option>
-                  </select>
-                </Setting>
-                <Setting label="حساسية كشف الصمت" hint="دقّة تحديد الفجوات">
-                  <select value={thr} disabled={phase === 'rendering'} onChange={(e) => setThr(+e.target.value)} className={selCls}>
-                    <option value={-40}>ناعمة — تشيل أهدى الأصوات</option>
-                    <option value={-35}>متوازنة</option>
-                    <option value={-30}>خفيفة — الفجوات الواضحة بس</option>
-                  </select>
-                </Setting>
+              <section className={`rounded-2xl border border-zinc-200 p-4 space-y-5 ${busy ? 'opacity-60 pointer-events-none' : ''}`}>
+                <div className="flex items-center justify-between">
+                  <h2 className="font-black text-sm">إعدادات القص</h2>
+                  {liveStats && (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold text-orange-600 bg-orange-50 border border-orange-100 rounded-full px-2 py-0.5">
+                      <AudioLines className="w-3 h-3" /> البريفيو لحظي
+                    </span>
+                  )}
+                </div>
+
+                {/* dB threshold — slider + live meter + smart suggestions */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-bold text-zinc-800">حساسية كشف الصمت</span>
+                    <span className="text-sm font-black text-orange-600 tabular-nums" dir="ltr">{thr} dB</span>
+                  </div>
+                  <DbMeter stats={wave?.stats ?? null} thr={thr} onSet={setThr} />
+                  <input
+                    type="range" min={-60} max={-20} step={1} value={thr} dir="ltr"
+                    onChange={(e) => setThr(+e.target.value)}
+                    aria-label="حد الصمت بالديسيبل"
+                    className="w-full h-2 rounded-full accent-orange-500 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] text-zinc-400 font-semibold" dir="ltr">
+                    <span>-60 · أهدى (يقص أي حاجة)</span>
+                    <span>-20 · أعلى (الصمت الواضح بس)</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {sugs.map((sg) => (
+                      <button
+                        key={sg.label}
+                        onClick={() => setThr(sg.db)}
+                        className={`rounded-lg border px-2.5 h-8 text-xs font-bold transition ${thr === sg.db ? 'border-orange-500 bg-orange-500 text-white' : 'border-zinc-200 bg-white text-zinc-600 hover:border-orange-300'}`}
+                      >
+                        {sg.label} <span className="opacity-70 font-semibold" dir="ltr">{sg.db}dB</span>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">{sugs.find((x) => x.db === thr)?.desc || `بنقيس أهدى صوت ومستوى الكلام في الفيديو ده ونرشّحلك أحسن نقطة — دلوقتي هيترقص ${String((s?.cutsCount ?? 0)).replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[+d])} فجوة`}</p>
+                </div>
+
+                {/* keep-gap padding slider */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-bold text-zinc-800">المسافة المتبقية حول الكلام</span>
+                    <span className="text-sm font-black text-orange-600 tabular-nums">{(gapMs / 1000).toFixed(2)} ث</span>
+                  </div>
+                  <input
+                    type="range" min={0} max={800} step={25} value={gapMs} dir="ltr"
+                    onChange={(e) => setGapMs(+e.target.value)}
+                    aria-label="المسافة المتبقية حول الكلام"
+                    className="w-full h-2 rounded-full accent-orange-500 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] text-zinc-400 font-semibold" dir="ltr">
+                    <span>0 · متلاصق</span>
+                    <span>0.8 ث · مريح</span>
+                  </div>
+                  <p className="text-[11px] text-zinc-400">قد إيه صمت نسيبه قبل الكلام وبعده — نص القيمة قبل ونص بعده عشان الإيقاع يبقى طبيعي</p>
+                </div>
+
+                {/* min-silence slider */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-bold text-zinc-800">أقصر صمت يتم قصه</span>
+                    <span className="text-sm font-black text-orange-600 tabular-nums">{(minSil / 1000).toFixed(2)} ث</span>
+                  </div>
+                  <input
+                    type="range" min={150} max={3000} step={50} value={minSil} dir="ltr"
+                    onChange={(e) => setMinSil(+e.target.value)}
+                    aria-label="أقصر صمت يتم قصه"
+                    className="w-full h-2 rounded-full accent-orange-500 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] text-zinc-400 font-semibold" dir="ltr">
+                    <span>0.15 ث</span>
+                    <span>3 ث</span>
+                  </div>
+                  <p className="text-[11px] text-zinc-400">السكتات الأقصر من كده بنسيبها زي ما هي — عشان الكلام ميبقاش عصبي</p>
+                </div>
+
+                {/* quality */}
                 <Setting label="الجودة والحجم" hint="الترميز بأقصى سرعة في كل الحالات">
-                  <select value={crf} disabled={phase === 'rendering'} onChange={(e) => setCrf(+e.target.value)} className={selCls}>
+                  <select value={crf} disabled={busy} onChange={(e) => setCrf(+e.target.value)} className={selCls}>
                     <option value={28}>عالية</option>
                     <option value={32}>متوازنة</option>
                     <option value={36}>حجم أصغر</option>
@@ -1144,27 +1245,28 @@ export default function Home() {
               </section>
             )}
 
-            {/* action: cut button */}
-            {phase === 'ready' && (
+            {/* action: cut button (also re-cut after done — no re-upload) */}
+            {(phase === 'ready' || phase === 'done') && (
               <button
                 onClick={startRender}
-                className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5"
+                disabled={(s?.cutsCount ?? 0) === 0}
+                className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5 disabled:opacity-60"
               >
                 <Zap className="w-5 h-5" />
-                قصّ الفيديو الآن
+                {phase === 'done' ? 'قصّه تاني بالإعدادات الجديدة' : 'قصّ الفيديو الآن'}
               </button>
             )}
 
-            {/* action: download (available from mirroring — output is already on disk) */}
+            {/* action: download — multi-lane accelerated with live speed */}
             {(phase === 'done' || phase === 'mirroring') && job!.output && (
               <div className="space-y-3">
-                <a
-                  href={`/api/jobs/${job!.id}/file?v=out&dl=1`}
-                  className="w-full h-14 rounded-2xl bg-orange-500 hover:bg-orange-600 active:scale-[0.99] text-white font-black text-lg shadow-lg shadow-orange-500/25 transition flex items-center justify-center gap-2.5"
-                >
-                  <Download className="w-5 h-5" />
-                  تحميل الفيديو ({fmtMB(job!.output.size)})
-                </a>
+                <DownloadButton
+                  url={`/api/jobs/${job!.id}/file?v=out&dl=1`}
+                  fileName={`${(job!.name || 'video').replace(/\.[^.]+$/, '')}-قصّاص.mp4`}
+                  size={job!.output.size}
+                  label={`تحميل الفيديو (${fmtMB(job!.output.size)})`}
+                  hint="تحميل متسارع بمسارات متوازية بيقيس السرعة لحظيًا"
+                />
                 <button
                   onClick={() => { setView('out'); videoRef.current?.load() }}
                   className="w-full h-11 rounded-2xl border border-zinc-200 hover:border-orange-300 text-zinc-700 font-bold transition flex items-center justify-center gap-2"
@@ -1339,6 +1441,51 @@ function Setting({ label, hint, children }: { label: string; hint?: string; chil
       {children}
       {hint && <span className="block text-xs text-zinc-400">{hint}</span>}
     </label>
+  )
+}
+
+/** dB meter — live gradient scale with the video's measured noise-floor and
+ *  speech-level markers; click/drag anywhere on it to set the threshold */
+function DbMeter({ stats, thr, onSet }: {
+  stats: { p10: number; p90: number } | null
+  thr: number
+  onSet: (db: number) => void
+}) {
+  const pos = (db: number) => Math.max(0, Math.min(100, ((db + 60) / 40) * 100))
+  const setFromEvent = (e: React.MouseEvent) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    const db = Math.round(-60 + ((e.clientX - r.left) / r.width) * 40)
+    onSet(Math.max(-60, Math.min(-20, db)))
+  }
+  return (
+    <div
+      dir="ltr"
+      onClick={setFromEvent}
+      className="relative h-9 cursor-pointer rounded-lg"
+      role="slider"
+      aria-label="مقياس الديسيبل — اضغط لاختيار الحساسية"
+      aria-valuenow={thr}
+      aria-valuemin={-60}
+      aria-valuemax={-20}
+    >
+      <div className="absolute inset-x-0 top-1.5 h-4 rounded-full bg-gradient-to-r from-zinc-200 via-amber-200 to-orange-400 border border-zinc-200/60" />
+      {stats && (
+        <>
+          <span className="absolute top-0 h-5.5 w-[2px] bg-zinc-400 rounded" style={{ left: `${pos(stats.p10)}%` }} title={`أهدى مستوى: ${stats.p10}dB`} />
+          <span className="absolute top-0 h-5.5 w-[2px] bg-orange-600 rounded" style={{ left: `${pos(stats.p90)}%` }} title={`مستوى الكلام: ${stats.p90}dB`} />
+        </>
+      )}
+      <span
+        className="absolute -top-0.5 w-[3px] h-6 rounded bg-zinc-900 shadow"
+        style={{ left: `calc(${pos(thr)}% - 1.5px)` }}
+      />
+      {stats && (
+        <span className="absolute -bottom-0.5 inset-x-0 flex justify-between text-[9px] text-zinc-400 font-bold tabular-nums px-0.5">
+          <span dir="ltr">ضوضاء {Math.round(stats.p10)}</span>
+          <span dir="ltr">كلام {Math.round(stats.p90)}</span>
+        </span>
+      )}
+    </div>
   )
 }
 

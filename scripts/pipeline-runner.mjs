@@ -103,19 +103,19 @@ function probe(file) {
 }
 
 // ---------------------------------------------------------------- scan + plan
-async function scanAndPlan(settings) {
-  const { gapMs, thresholdDb } = settings
+/** probe the source once — shared by every planning path */
+async function probeMeta() {
   const info = await probe(src)
   const v = info.streams.find((s) => s.codec_type === 'video')
   const a = info.streams.find((s) => s.codec_type === 'audio')
   if (!a) throw new Error('NO_AUDIO')
+  if (!v) throw new Error('NO_VIDEO')
   const [num, den] = v.r_frame_rate.split('/').map(Number)
   const fps = num / (den || 1)
   const duration = parseFloat(info.format.duration)
   const sr = parseInt(a.sample_rate, 10)
   const ch = a.channels
   const totalFrames = Math.max(1, Math.round(duration * fps))
-
   const meta = {
     durationMs: Math.round(duration * 1000),
     fps: Math.round(fps * 1000) / 1000,
@@ -123,6 +123,26 @@ async function scanAndPlan(settings) {
     vcodec: v.codec_name, acodec: a.codec_name,
     sr, ch, size: parseInt(info.format.size, 10),
   }
+  const [tbNum, tbDen] = (v.time_base || '1/90000').split('/').map(Number)
+  const ticksPerFrame = Math.round((tbDen * den) / (tbNum * num))
+  const frameGrid = {
+    fps, totalFrames, tbNum, tbDen, ticksPerFrame, fpsNum: num, fpsDen: den,
+    ticksInt: Math.abs((tbDen * den) / (tbNum * num) - ticksPerFrame) < 1e-9,
+  }
+  return { meta, frameGrid, duration, fps, totalFrames }
+}
+
+/** plan summary that lands in job.json (what the UI displays) */
+function planSummary(plan) {
+  return {
+    settings: plan.settings, durationMs: plan.durationMs, keptMs: plan.keptMs,
+    savedMs: plan.savedMs, cutsCount: plan.cutsCount, cuts: plan.cuts,
+  }
+}
+
+async function scanAndPlan(settings) {
+  const { gapMs, thresholdDb } = settings
+  const { meta, frameGrid, duration, fps, totalFrames } = await probeMeta()
 
   // -- silencedetect (audio-only, min duration = gap) --
   let stderr = ''
@@ -143,10 +163,7 @@ async function scanAndPlan(settings) {
 
   // -- frame-grid plan: keep `gap` of every silence longer than gap --
   const keepSec = gapMs / 1000
-  const [tbNum, tbDen] = (v.time_base || '1/90000').split('/').map(Number)
-  const [fpsNum, fpsDen] = [num, den]
-  // ticks per frame in the source timebase (integer for all sane files)
-  const ticksPerFrame = Math.round((tbDen * fpsDen) / (tbNum * fpsNum))
+  const { tbNum, tbDen, ticksPerFrame, fpsNum, fpsDen, ticksInt } = frameGrid
   const windows = []   // [fa, fb) frame indices kept
   const cuts = []      // [ms, ms] removed spans (original timeline, for preview)
   let cur = 0
@@ -164,9 +181,8 @@ async function scanAndPlan(settings) {
 
   const keptFrames = windows.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
   const plan = {
-    settings, fps, sr, ch, totalFrames, tbNum, tbDen, ticksPerFrame,
-    fpsNum, fpsDen,
-    ticksInt: Math.abs((tbDen * fpsDen) / (tbNum * fpsNum) - ticksPerFrame) < 1e-9,
+    settings, fps, sr: meta.sr, ch: meta.ch, totalFrames, tbNum, tbDen, ticksPerFrame,
+    fpsNum, fpsDen, ticksInt,
     durationMs: meta.durationMs,
     keptMs: Math.round(keptFrames * 1000 / fps),
     savedMs: Math.round(savedMs),
@@ -174,10 +190,55 @@ async function scanAndPlan(settings) {
     cuts, windows,
   }
   writeJSON(planFile, plan)
-  setPhase('ready', { meta, plan: {
-    settings, durationMs: meta.durationMs, keptMs: plan.keptMs, savedMs: plan.savedMs,
-    cutsCount: cuts.length, cuts,
-  } })
+  setPhase('ready', { meta, plan: planSummary(plan) })
+  return { plan, meta }
+}
+
+/** EXPLICIT montage plan — the browser detected + hand-tuned the cuts on the
+ *  audio envelope (dragging boundaries, excluding gaps) and sent the exact
+ *  list; the render then matches the live preview 1:1. */
+async function planFromCuts(settings) {
+  const raw = Array.isArray(settings.cuts) ? settings.cuts : []
+  const cuts = []
+  for (const c of raw) {
+    if (!Array.isArray(c) || c.length < 2) continue
+    const s = Math.max(0, Math.round(Number(c[0]) || 0))
+    const e = Math.round(Number(c[1]) || 0)
+    if (e - s < 20) continue
+    const last = cuts[cuts.length - 1]
+    if (last && s <= last[1] + 1) last[1] = Math.max(last[1], e)
+    else cuts.push([s, e])
+  }
+  if (!cuts.length) throw new Error('NO_CUTS')
+
+  const { meta, frameGrid, fps, totalFrames } = await probeMeta()
+  const { tbNum, tbDen, ticksPerFrame, fpsNum, fpsDen, ticksInt } = frameGrid
+  const windows = []
+  let cur = 0
+  let savedMs = 0
+  for (const [sMs, eMs] of cuts) {
+    const keepEndF = Math.floor((sMs / 1000) * fps)
+    const resumeF = Math.ceil((eMs / 1000) * fps)
+    if (keepEndF - cur > 1) windows.push([cur, keepEndF])
+    savedMs += (resumeF - keepEndF) * 1000 / fps
+    cur = Math.max(cur, resumeF)
+  }
+  if (totalFrames - cur > 1) windows.push([cur, totalFrames])
+  const keptFrames = windows.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
+  const plan = {
+    settings, fps, sr: meta.sr, ch: meta.ch, totalFrames, tbNum, tbDen, ticksPerFrame,
+    fpsNum, fpsDen, ticksInt,
+    durationMs: meta.durationMs,
+    keptMs: Math.round(keptFrames * 1000 / fps),
+    savedMs: Math.round(savedMs),
+    cutsCount: cuts.length,
+    cuts, windows,
+  }
+  writeJSON(planFile, plan)
+  // refresh the plan summary in job.json WITHOUT touching the current phase
+  const j = JSON.parse(fs.readFileSync(jobFile, 'utf8'))
+  j.plan = planSummary(plan)
+  writeJSON(jobFile, j)
   return { plan, meta }
 }
 
@@ -404,7 +465,9 @@ async function render(settings) {
   setPhase('rendering')
   progress({ phase: 'rendering', stage: AR.scanning, pct: 2 })
 
-  const { plan } = await getPlan({ gapMs, thresholdDb })
+  const { plan } = settings.cuts
+    ? await planFromCuts(settings)
+    : await getPlan({ gapMs, thresholdDb })
   logStd(`plan: cuts=${plan.cutsCount} kept=${plan.keptMs}ms saved=${plan.savedMs}ms`)
 
   const outPath = path.join(dir, 'out.mp4')
@@ -485,11 +548,16 @@ try {
     logStd('analyze done')
   } else {
     const s = JSON.parse(settingsArg || '{}')
-    const settings = {
-      gapMs: [100, 200, 300].includes(s.gapMs) ? s.gapMs : 200,
-      thresholdDb: [-40, -35, -30].includes(s.thresholdDb) ? s.thresholdDb : -35,
-      crf: [28, 32, 36].includes(s.crf) ? s.crf : 32,
+    const clamp = (v, lo, hi, d) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d
     }
+    const settings = {
+      gapMs: clamp(s.gapMs, 0, 1000, 200),
+      thresholdDb: clamp(s.thresholdDb, -70, -5, -35),
+      crf: clamp(s.crf, 18, 40, 32),
+    }
+    if (Array.isArray(s.cuts) && s.cuts.length) settings.cuts = s.cuts
     await render(settings)
   }
   process.exit(0)

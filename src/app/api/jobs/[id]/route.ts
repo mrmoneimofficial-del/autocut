@@ -62,8 +62,11 @@ export async function GET(_req: Request, ctx: Ctx) {
   return Response.json(st)
 }
 
-/** POST /api/jobs/:id — { action: 'analyze' } | { action:'render', gapMs, thresholdDb, crf }
- *  (jobs are staged as phase 'uploaded' by /api/uploads/chunked/complete) */
+/** POST /api/jobs/:id — { action: 'analyze' } |
+ *  { action:'render', gapMs, thresholdDb, crf, cuts?: [start,end][] }
+ *  (jobs are staged as phase 'uploaded' by /api/uploads/chunked/complete.
+ *   `cuts` = the EXPLICIT montage plan computed (and hand-tuned) in the browser
+ *   from the audio envelope — the render then matches the preview exactly.) */
 export async function POST(req: Request, ctx: Ctx) {
   const { id } = await ctx.params
   if (!/^[a-f0-9]{32}$/.test(id)) return Response.json({ error: 'NOT_FOUND' }, { status: 404 })
@@ -87,14 +90,41 @@ export async function POST(req: Request, ctx: Ctx) {
   }
 
   if (action === 'render') {
-    if (job.phase !== 'ready' && job.phase !== 'error') {
+    // 'done' too → re-cut with tweaked settings without re-uploading
+    if (job.phase !== 'ready' && job.phase !== 'error' && job.phase !== 'done') {
       return Response.json({ error: 'الفيديو مش جاهز للقص بعد' }, { status: 409 })
     }
-    const settings = {
-      gapMs: [100, 200, 300].includes(Number(body?.gapMs)) ? Number(body.gapMs) : 200,
-      thresholdDb: [-40, -35, -30].includes(Number(body?.thresholdDb)) ? Number(body.thresholdDb) : -35,
-      crf: [28, 32, 36].includes(Number(body?.crf)) ? Number(body.crf) : 32,
+    const clamp = (v: unknown, lo: number, hi: number, d: number) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d
     }
+    const settings: Record<string, unknown> = {
+      gapMs: clamp(body?.gapMs, 0, 1000, 200),
+      thresholdDb: clamp(body?.thresholdDb, -70, -5, -35),
+      crf: clamp(body?.crf, 18, 40, 32),
+    }
+
+    // explicit montage cuts from the browser (validated + sanitized here,
+    // re-validated in the runner — both sides must agree on the plan)
+    if (Array.isArray(body?.cuts)) {
+      const durMs = Number(job?.meta?.durationMs || 0)
+      const maxEnd = durMs > 0 ? durMs + 2000 : Number.MAX_SAFE_INTEGER
+      const raw = (body.cuts as unknown[])
+        .filter((c): c is [number, number] => Array.isArray(c) && c.length >= 2
+          && Number.isFinite(Number(c[0])) && Number.isFinite(Number(c[1])))
+        .map((c) => [Math.max(0, Math.round(Number(c[0]))), Math.round(Number(c[1]))] as [number, number])
+        .filter(([s, e]) => e - s >= 20 && s < maxEnd)
+        .sort((a, b) => a[0] - b[0])
+      const merged: Array<[number, number]> = []
+      for (const [s, e] of raw) {
+        const last = merged[merged.length - 1]
+        if (last && s <= last[1] + 1) last[1] = Math.max(last[1], e)
+        else merged.push([s, e])
+      }
+      if (!merged.length) return Response.json({ error: 'مفيش فجوات مختارة — عدّل الإعدادات الأول' }, { status: 400 })
+      settings.cuts = merged.slice(0, 2000)
+    }
+
     job.phase = 'rendering'
     job.error = undefined
     job.renderSettings = settings
