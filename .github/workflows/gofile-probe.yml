@@ -1,0 +1,114 @@
+# TEMPORARY one-shot probe: verify GoFile API behavior from a clean IP
+# (the dev sandbox IP is DDoS-blocked by gofile). Removed after verification.
+name: GoFile API probe
+on:
+  push:
+    paths: ['.github/workflows/gofile-probe.yml']
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe upload / download / CORS / wt
+        run: |
+          echo '================================================== 0. servers list'
+          curl -sS --max-time 30 'https://api.gofile.io/servers' | head -c 800; echo
+
+          echo '================================================== 1. bare guest upload (with Origin header for CORS check)'
+          head -c 150000 /dev/urandom > probe.mp4
+          curl -sS --max-time 90 -D /tmp/h1.txt \
+               -H 'Origin: https://autocut-gules.vercel.app' \
+               -F 'file=@probe.mp4' \
+               https://upload.gofile.io/uploadfile -o /tmp/up.json || echo 'UPLOAD FAILED'
+          echo '--- response headers (CORS?):'; cat /tmp/h1.txt
+          echo '--- response body:'; cat /tmp/up.json; echo
+
+          echo '================================================== 2. CORS preflight on upload endpoint'
+          curl -sS --max-time 30 -X OPTIONS -o /dev/null -D - \
+               -H 'Origin: https://autocut-gules.vercel.app' \
+               -H 'Access-Control-Request-Method: POST' \
+               https://upload.gofile.io/uploadfile | head -20
+
+          echo '================================================== 3. extract upload fields'
+          TOKEN=$(python3 -c "import json;d=json.load(open('/tmp/up.json')).get('data',{});print(d.get('guestToken') or d.get('token') or '')" 2>/dev/null)
+          FID=$(python3 -c "import json;print(json.load(open('/tmp/up.json'))['data']['id'])" 2>/dev/null)
+          FNAME=$(python3 -c "import json;print(json.load(open('/tmp/up.json'))['data']['name'])" 2>/dev/null)
+          PF=$(python3 -c "import json;print(json.load(open('/tmp/up.json'))['data'].get('parentFolder',''))" 2>/dev/null)
+          SRV=$(python3 -c "import json;d=json.load(open('/tmp/up.json'))['data'];print((d.get('servers') or ['store-1'])[0])" 2>/dev/null)
+          echo "guestToken=${TOKEN:0:12}... fileId=$FID name=$FNAME parentFolder=$PF server=$SRV"
+
+          echo '================================================== 4. GET file metadata with owner guest token'
+          curl -sS --max-time 30 "https://api.gofile.io/contents/$FID" \
+               -H "Authorization: Bearer $TOKEN" | head -c 1500; echo
+
+          echo '================================================== 5. web download URL variants'
+          U="https://$SRV.gofile.io/download/web/$FID/$FNAME"
+          echo "--- bare:";      curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U" || echo FAIL
+          echo "--- ?wt=bogus:";  curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U?wt=deadbeef" || echo FAIL
+          echo "--- ?token=guest:"; curl -sS --max-time 60 -o /dev/null -w 'HTTP %{http_code} size=%{size_download}\n' "$U?token=$TOKEN" || echo FAIL
+          echo "--- headers of bare attempt:"; curl -sS --max-time 60 -D - -o /dev/null "$U" | head -15
+
+          echo '================================================== 6. wt.obf.js (website token)'
+          curl -sS --max-time 30 https://gofile.io/ -o /tmp/home.html
+          WTJS=$(grep -oE '/js/wt[^"'"'"']*\.js' /tmp/home.html | head -1)
+          echo "wt script path: $WTJS"
+          curl -sS --max-time 30 "https://gofile.io$WTJS" -o /tmp/wt.js
+          echo '--- wt.js (first 2500 chars):'; head -c 2500 /tmp/wt.js; echo
+          WT=$(python3 -c "
+          import re
+          s = open('/tmp/wt.js', encoding='utf-8', errors='replace').read()
+          cands = re.findall(r'[a-f0-9]{32}', s)
+          print(cands[0] if cands else '')")
+          echo "regex-extracted wt: $WT"
+
+          echo '================================================== 7. reference content QGHOtrZH via wt'
+          if [ -n "$WT" ]; then
+            curl -sS --max-time 30 "https://api.gofile.io/contents/QGHOtrZH?wt=$WT" -o /tmp/ref.json
+            head -c 2500 /tmp/ref.json; echo
+            REFID=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('/tmp/ref.json'))['data']
+            ch = d.get('children') or {}
+            for k, v in ch.items():
+                if v.get('type') == 'file':
+                    print(v['id']); break
+          except Exception as e:
+            print('')")
+            REFNAME=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('/tmp/ref.json'))['data']
+            ch = d.get('children') or {}
+            for k, v in ch.items():
+                if v.get('type') == 'file':
+                    print(v['name']); break
+          except Exception:
+            print('')")
+            REFLINK=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('/tmp/ref.json'))['data']
+            ch = d.get('children') or {}
+            for k, v in ch.items():
+                if v.get('type') == 'file':
+                    print(v.get('link') or ''); break
+          except Exception:
+            print('')")
+            echo "reference file: id=$REFID name=$REFNAME link=$REFLINK"
+            if [ -n "$REFID" ]; then
+              echo '--- trying to download the reference file (text head):'
+              curl -sSL --max-time 60 "$U_REF" -o /dev/null 2>/dev/null
+              curl -sSL --max-time 60 "https://$SRV.gofile.io/download/web/$REFID/$REFNAME?wt=$WT" -o /tmp/ref.bin
+              echo "size: $(stat -c%s /tmp/ref.bin 2>/dev/null)"; file /tmp/ref.bin 2>/dev/null; head -c 1800 /tmp/ref.bin; echo
+            fi
+          else
+            echo 'wt extraction failed — skipping reference probe'
+          fi
+
+          echo '================================================== 8. second upload reusing guestToken + parentFolder'
+          head -c 50000 /dev/urandom > probe2.mp4
+          curl -sS --max-time 90 -F 'file=@probe2.mp4' -F "token=$TOKEN" -F "folderId=$PF" \
+               https://upload.gofile.io/uploadfile | head -c 1200; echo
