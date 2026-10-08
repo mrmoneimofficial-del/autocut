@@ -1,4 +1,7 @@
-import { resolveBins, GOFILE_API, GOFILE_UPLOAD, gofileWebDownloadUrl } from '@/lib/cloud'
+import { resolveBins, GOFILE_API, GOFILE_UPLOAD, resolveGofileDownload, downloadToFile } from '@/lib/cloud'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -9,8 +12,8 @@ export const runtime = 'nodejs'
  *
  *   servers   → can we reach api.gofile.io at all?
  *   upload    → can we upload a tiny probe file to the upload fleet?
- *   meta      → does the owner-metadata lookup return a usable link?
- *   download  → can we actually download the bytes back?
+ *   download  → the REAL resolution chain (guest account + computed
+ *               X-Website-Token → data.link → bytes) — same code the cut uses
  *
  * Results are cached in-process for 5 minutes. ?fresh=1 forces a re-run.
  */
@@ -33,25 +36,25 @@ export async function GET(req: Request) {
   const steps = out.steps as Record<string, any>
 
   // 1. api reachability
-  let serverName = ''
   try {
     const t0 = Date.now()
-    const r = await fetch(`${GOFILE_API}/servers`, { signal: AbortSignal.timeout(8_000) })
+    const r = await fetch(`${GOFILE_API}/servers`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(8_000),
+    })
     const j = await r.json().catch(() => null)
-    serverName = String(j?.data?.servers?.[0]?.name || '')
-    steps.servers = { ok: j?.status === 'ok' && !!serverName, ms: t(Date.now() - t0), first: serverName }
+    steps.servers = { ok: j?.status === 'ok', ms: t(Date.now() - t0), first: j?.data?.servers?.[0]?.name || '' }
   } catch (e: unknown) {
     steps.servers = { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
   if (!steps.servers.ok) {
-    out.verdict = 'gofile-unreachable-from-server'
+    out.verdict = 'gofile-unreachable-from-server (datacenter IPs are often blocked by gofile — uploads from the browser still work)'
     cache = { at: Date.now(), json: out }
     return Response.json(out)
   }
 
   // 2. tiny upload through the same fleet the browser uses
   let fileId = ''
-  let fileName = ''
   let guestToken = ''
   try {
     const t0 = Date.now()
@@ -61,7 +64,6 @@ export async function GET(req: Request) {
     const r = await fetch(GOFILE_UPLOAD, { method: 'POST', body: fd, signal: AbortSignal.timeout(20_000) })
     const j = await r.json().catch(() => null)
     fileId = String(j?.data?.id || '')
-    fileName = String(j?.data?.name || 'qattaas-diag.bin')
     guestToken = String(j?.data?.guestToken || '')
     steps.upload = { ok: j?.status === 'ok' && !!fileId, ms: t(Date.now() - t0), guest: !!guestToken }
   } catch (e: unknown) {
@@ -73,40 +75,25 @@ export async function GET(req: Request) {
     return Response.json(out)
   }
 
-  // 3. owner metadata → link
-  let link = ''
+  // 3+4. the REAL download chain the cut uses
+  const dest = path.join(os.tmpdir(), `qattaas-diag-${Date.now()}.bin`)
   try {
     const t0 = Date.now()
-    const r = await fetch(`${GOFILE_API}/contents/${encodeURIComponent(fileId)}`, {
-      headers: guestToken ? { Authorization: `Bearer ${guestToken}` } : {},
-      signal: AbortSignal.timeout(10_000),
+    const dl = await resolveGofileDownload({
+      id: fileId, name: 'qattaas-diag.bin', size: 2048, guestToken: guestToken || undefined,
     })
-    const j = await r.json().catch(() => null)
-    link = String(j?.data?.link || '')
-    steps.meta = { ok: j?.status === 'ok', ms: t(Date.now() - t0), hasLink: !!link, premiumOnly: j?.status === 'error-notPremium' }
+    const ms = t(Date.now() - t0)
+    const got = await downloadToFile(dl.url, dest, { maxBytes: 4096, headers: dl.headers, signal: AbortSignal.timeout(15_000) })
+    steps.download = { ok: got === 2048, ms, via: dl.via, bytes: got }
   } catch (e: unknown) {
-    steps.meta = { ok: false, error: e instanceof Error ? e.message : String(e) }
+    steps.download = { ok: false, error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    try { fs.rmSync(dest, { force: true }) } catch { /* ignore */ }
   }
 
-  // 4. download the bytes back — metadata link first, then the classic web URL
-  const urls = [link, gofileWebDownloadUrl({ id: fileId, name: fileName, server: serverName })].filter(Boolean)
-  let downloadOk = false
-  for (const u of urls) {
-    try {
-      const t0 = Date.now()
-      const r = await fetch(u, { signal: AbortSignal.timeout(15_000) })
-      const buf = await r.arrayBuffer().catch(() => new ArrayBuffer(0))
-      downloadOk = r.ok && buf.byteLength === 2048
-      steps.download = { ok: downloadOk, ms: t(Date.now() - t0), via: u.includes('/download/web/') ? 'web-url' : 'meta-link', status: r.status, bytes: buf.byteLength }
-      if (downloadOk) break
-    } catch (e: unknown) {
-      steps.download = { ok: false, error: e instanceof Error ? e.message : String(e), via: u.includes('/download/web/') ? 'web-url' : 'meta-link' }
-    }
-  }
-
-  out.verdict = downloadOk
-    ? 'gofile-fully-usable-from-server ✓'
-    : 'server-can-upload-but-not-download (cut will fail here — uploads still work)'
+  out.verdict = steps.download?.ok
+    ? 'gofile-fully-usable-from-server ✓ (full cloud cut works here)'
+    : 'server-cannot-download-from-gofile (cut will fail here — browser uploads still work; use Colab/Codespaces for the cut)'
   cache = { at: Date.now(), json: out }
   return Response.json(out)
 }

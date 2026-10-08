@@ -102,11 +102,12 @@ export async function POST(req: Request) {
         const have = fs.existsSync(src) && (!declaredSize || fs.statSync(src).size === declaredSize)
         if (!have) {
           send({ stage: 'download', pct: 0, text: 'بننزّل الفيديو من السحابة…' })
-          const url = await resolveGofileDownload({ ...f, name })
+          const dl = await resolveGofileDownload({ ...f, name })
           const abort = AbortSignal.any([req.signal, AbortSignal.timeout(DEADLINE_MS)])
-          const got = await downloadToFile(url, src, {
+          const got = await downloadToFile(dl.url, src, {
             maxBytes,
             signal: abort,
+            headers: dl.headers,
             onProgress: (gotBytes, total) => {
               const pct = total ? Math.min(99, Math.round((gotBytes / total) * 100)) : 0
               send({ stage: 'download', pct, text: 'بننزّل الفيديو من السحابة…' })
