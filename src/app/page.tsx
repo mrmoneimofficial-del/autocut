@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Scissors, Upload, Download, Zap, Loader2, RefreshCw, HardDrive, Film,
   AlertTriangle, CheckCircle2, Eye, FastForward, Clock, CloudUpload, ExternalLink, Rocket, Github,
+  Pause, Play, X,
 } from 'lucide-react'
 
 /* ------------------------------------------------------------------ types */
@@ -39,7 +40,7 @@ const fmtETA = (sec: number) => {
 /* -------------------------------------------------------------- uploading */
 const LANES = 4 // parallel upload lanes — saturates the pipe instead of waiting per-chunk
 
-function putChunk(jobId: string, offset: number, blob: Blob, sha: string, onLoaded: (n: number) => void) {
+function putChunk(jobId: string, offset: number, blob: Blob, sha: string, onLoaded: (n: number) => void, signal?: AbortSignal) {
   return new Promise<{ ok: boolean; status: number; data: any }>((resolve) => {
     const xhr = new XMLHttpRequest()
     xhr.open('PUT', `/api/jobs/${jobId}/file?offset=${offset}`)
@@ -53,10 +54,17 @@ function putChunk(jobId: string, offset: number, blob: Blob, sha: string, onLoad
     }
     xhr.onerror = () => resolve({ ok: false, status: 0, data: null })
     xhr.ontimeout = () => resolve({ ok: false, status: 0, data: null })
+    xhr.onabort = () => resolve({ ok: false, status: 0, data: null })
+    if (signal) {
+      if (signal.aborted) return resolve({ ok: false, status: 0, data: null })
+      signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    }
     xhr.timeout = 300000
     xhr.send(blob)
   })
 }
+
+function cancelErr() { return Object.assign(new Error('اتلغى الرفع'), { name: 'CancelError' }) }
 
 async function sha256Hex(blob: Blob): Promise<string> {
   try {
@@ -79,20 +87,23 @@ function chunkDone(intervals: [number, number][], s: number, e: number) {
 }
 
 /**
- * Resumable parallel uploader.
+ * Resumable parallel uploader (gofile-style user control).
  * - 4 lanes pull chunk indexes from a shared queue (out-of-order server writes)
  * - every chunk carries SHA-256; server verifies before writing
  * - unlimited retries with capped backoff — network drops / server restarts
  *   NEVER restart the upload from zero: server coverage map tells us what's
  *   already on disk and we only send the missing ranges
+ * - user can PAUSE (lanes drain gracefully, coverage kept) or CANCEL (throws)
  */
 async function uploadFile(
   jobId: string,
   file: File,
-  onProgress: (sent: number) => void,
+  onProgress: (sent: number, lanes: number[]) => void,
   onNotice: (msg: string) => void,
   resumeIntervals?: [number, number][],
-) {
+  ctrl?: { paused: boolean; cancelled: boolean },
+  signal?: AbortSignal,
+): Promise<'done' | 'paused'> {
   const CHUNK = 8 * 1024 * 1024
   const size = file.size
   const nChunks = Math.max(1, Math.ceil(size / CHUNK))
@@ -106,42 +117,60 @@ async function uploadFile(
     }
     if (doneBytes > 0) onNotice(`كمّلنا من حيث وقفنا — ${fmtMB(doneBytes)} كانوا اترفعوا خلاص`)
   }
-  onProgress(doneBytes)
+  onProgress(doneBytes, new Array(LANES).fill(0))
 
   const queue: number[] = []
   for (let i = 0; i < nChunks; i++) if (!covered[i]) queue.push(i)
-  if (queue.length === 0) return
+  if (queue.length === 0) return 'done'
 
   const inflight: number[] = new Array(LANES).fill(0)
-  const report = () => onProgress(doneBytes + inflight.reduce((a, b) => a + b, 0))
+  const report = () => onProgress(doneBytes + inflight.reduce((a, b) => a + b, 0), [...inflight])
+  const stopped = () => {
+    if (ctrl?.cancelled) throw cancelErr()
+    return !!ctrl?.paused
+  }
 
   const lane = async (li: number) => {
-    while (true) {
-      const idx = queue.shift()
-      if (idx === undefined) return
-      const start = idx * CHUNK, end = Math.min(start + CHUNK, size)
-      const blob = file.slice(start, end)
-      const sha = await sha256Hex(blob)
-      inflight[li] = 0
-      for (let attempt = 0; ; attempt++) {
-        const res = await putChunk(jobId, start, blob, sha, (loaded) => { inflight[li] = loaded; report() })
-        if (res.ok) break
-        if (res.status === 409) {
-          // server closed the upload phase (already complete) → lane done
-          if (res.data?.complete) return
-          throw new Error(res.data?.error || 'الرفع اتقفل من السيرفر')
+    try {
+      while (true) {
+        if (stopped()) return
+        const idx = queue.shift()
+        if (idx === undefined) return
+        const start = idx * CHUNK, end = Math.min(start + CHUNK, size)
+        const blob = file.slice(start, end)
+        const sha = await sha256Hex(blob)
+        inflight[li] = 0
+        for (let attempt = 0; ; attempt++) {
+          if (stopped()) return
+          const res = await putChunk(jobId, start, blob, sha, (loaded) => { inflight[li] = loaded; report() }, signal)
+          if (res.ok) break
+          if (stopped()) return
+          if (res.status === 409) {
+            // server closed the upload phase (already complete) → lane done
+            if (res.data?.complete) return
+            throw new Error(res.data?.error || 'الرفع اتقفل من السيرفر')
+          }
+          if (res.status === 422 && attempt >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
+          if (attempt === 0) onNotice('مشكلة شبكة — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
+          else if (attempt % 5 === 4) onNotice(`لسه بنحاول — محاولة ${attempt + 1} (عند ${fmtMB(start)})`)
+          // capped backoff in 200ms ticks so pause/cancel take effect instantly
+          const backoff = Math.min(8000, 700 * 2 ** Math.min(attempt, 4))
+          for (let t = 0; t < backoff; t += 200) {
+            if (stopped()) return
+            await new Promise((r) => setTimeout(r, 200))
+          }
         }
-        if (res.status === 422 && attempt >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
-        if (attempt === 0) onNotice('مشكلة شبكة — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
-        else if (attempt % 5 === 4) onNotice(`لسه بنحاول — محاولة ${attempt + 1} (عند ${fmtMB(start)})`)
-        await new Promise((r) => setTimeout(r, Math.min(8000, 700 * 2 ** Math.min(attempt, 4))))
+        inflight[li] = 0
+        doneBytes += end - start
+        report()
       }
+    } finally {
       inflight[li] = 0
-      doneBytes += end - start
       report()
     }
   }
   await Promise.all(Array.from({ length: LANES }, (_, i) => lane(i)))
+  return ctrl?.paused ? 'paused' : 'done'
 }
 
 /* --------------------------------------------------------------- timeline */
@@ -214,7 +243,9 @@ export default function Home() {
   const [job, setJob] = useState<Job | null>(null)
   const [jobErr, setJobErr] = useState<string | null>(null)
   const [showcase, setShowcase] = useState(false) // server refused upload: read-only serverless host (Vercel…)
-  const [up, setUp] = useState<{ file: File; sent: number; speed: number } | null>(null)
+  const [up, setUp] = useState<{ file: File; sent: number; speed: number; lanes: number[] } | null>(null)
+  const [upPaused, setUpPaused] = useState(false)
+  const [dragOver, setDragOver] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [view, setView] = useState<'src' | 'out'>('src')
   const [skip, setSkip] = useState(true)
@@ -228,6 +259,10 @@ export default function Home() {
   const skipRef = useRef(true)
   const viewRef = useRef<'src' | 'out'>('src')
   const speedTracker = useRef({ last: 0, at: 0 })
+  const upCtrl = useRef({ paused: false, cancelled: false })
+  const upAbort = useRef<AbortController | null>(null)
+  const upFileRef = useRef<File | null>(null)
+  const upIdRef = useRef<string>('')
 
   useEffect(() => { skipRef.current = skip }, [skip])
   useEffect(() => { viewRef.current = view }, [view])
@@ -258,77 +293,127 @@ export default function Home() {
     return () => clearInterval(t)
   }, [job, refresh])
 
-  /* upload flow */
-  const startUpload = useCallback(async (file: File) => {
-    setJobErr(null)
-    setShowcase(false)
-    setNotice(null)
-    setUp({ file, sent: 0, speed: 0 })
+  /* upload flow — shared runner (upload + kick off analyze) */
+  const runUploadAndAnalyze = useCallback(async (id: string, file: File, resumeIntervals?: [number, number][]) => {
+    upIdRef.current = id
+    upFileRef.current = file
+    upCtrl.current = { paused: false, cancelled: false }
+    upAbort.current = new AbortController()
+    setUpPaused(false)
     speedTracker.current = { last: 0, at: Date.now() }
     try {
-      // resume an interrupted upload of the SAME file if one exists on the server
-      let id = ''
-      let resumeIntervals: [number, number][] | undefined
-      const savedId = localStorage.getItem('qattaas:job')
-      if (savedId) {
-        try {
-          const r = await fetch(`/api/jobs/${savedId}`, { cache: 'no-store' })
-          if (r.ok) {
-            const j = await r.json()
-            if (j?.phase === 'uploading' && j.name === file.name && Number(j.size) === file.size) {
-              id = String(j.id)
-              resumeIntervals = (j.uploadIntervals || []).map(
-                (iv: any) => [Number(iv[0]), Number(iv[1])] as [number, number],
-              )
-            }
-          }
-        } catch { /* offline — fall through to fresh job */ }
-      }
-
-      if (!id) {
-        const r = await fetch('/api/jobs', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: file.name, size: file.size }),
-        })
-        if (!r.ok) {
-          if (r.status === 503) setShowcase(true)
-          throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
-        }
-        const { id: newId } = await r.json()
-        id = String(newId)
-        localStorage.setItem('qattaas:job', id)
-      }
-
-      await uploadFile(
+      const outcome = await uploadFile(
         id,
         file,
-        (sent) => {
+        (sent, lanes) => {
           const tr = speedTracker.current
           const now = Date.now()
           if (now - tr.at > 700 && sent > tr.last) {
             const speed = ((sent - tr.last) / 1024 / 1024) / ((now - tr.at) / 1000)
-            setUp((u) => (u ? { ...u, sent, speed } : u))
+            setUp((u) => (u ? { ...u, sent, speed, lanes } : u))
             speedTracker.current = { last: sent, at: now }
           } else {
-            setUp((u) => (u ? { ...u, sent } : u))
+            setUp((u) => (u ? { ...u, sent, lanes } : u))
           }
         },
         (msg) => setNotice(msg),
         resumeIntervals,
+        upCtrl.current,
+        upAbort.current.signal,
       )
+      if (outcome === 'paused') { setUpPaused(true); return }
       const ar = await fetch(`/api/jobs/${id}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'analyze' }),
       })
       if (!ar.ok) throw new Error('فشل بدء التحليل')
       setView('src')
+      setUp(null)
       await refresh(id)
     } catch (e: any) {
-      setJobErr(e?.message || 'حصل خطأ في الرفع')
-    } finally {
-      setUp(null)
+      if (e?.name === 'CancelError') {
+        localStorage.removeItem('qattaas:job')
+        setUp(null); setNotice(null)
+      } else {
+        setJobErr(e?.message || 'حصل خطأ في الرفع')
+        setUp(null)
+      }
     }
   }, [refresh])
+
+  const startUpload = useCallback(async (file: File) => {
+    setJobErr(null)
+    setShowcase(false)
+    setNotice(null)
+    setUp({ file, sent: 0, speed: 0, lanes: [0, 0, 0, 0] })
+    // resume an interrupted upload of the SAME file if one exists on the server
+    let id = ''
+    let resumeIntervals: [number, number][] | undefined
+    const savedId = localStorage.getItem('qattaas:job')
+    if (savedId) {
+      try {
+        const r = await fetch(`/api/jobs/${savedId}`, { cache: 'no-store' })
+        if (r.ok) {
+          const j = await r.json()
+          if (j?.phase === 'uploading' && j.name === file.name && Number(j.size) === file.size) {
+            id = String(j.id)
+            resumeIntervals = (j.uploadIntervals || []).map(
+              (iv: any) => [Number(iv[0]), Number(iv[1])] as [number, number],
+            )
+          }
+        }
+      } catch { /* offline — fall through to fresh job */ }
+    }
+
+    if (!id) {
+      const r = await fetch('/api/jobs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: file.name, size: file.size }),
+      })
+      if (!r.ok) {
+        if (r.status === 503) setShowcase(true)
+        setUp(null)
+        throw new Error((await r.json().catch(() => null))?.error || 'فشل إنشاء المهمة')
+      }
+      const { id: newId } = await r.json()
+      id = String(newId)
+      localStorage.setItem('qattaas:job', id)
+    }
+    await runUploadAndAnalyze(id, file, resumeIntervals)
+  }, [runUploadAndAnalyze])
+
+  const pauseUpload = () => {
+    upCtrl.current.paused = true
+    upAbort.current?.abort() // in-flight chunks abort → lanes drain gracefully
+  }
+
+  const resumeUpload = async () => {
+    const file = upFileRef.current, id = upIdRef.current
+    if (!file || !id) return
+    setUpPaused(false)
+    setNotice(null)
+    let iv: [number, number][] | undefined
+    try {
+      const r = await fetch(`/api/jobs/${id}`, { cache: 'no-store' })
+      if (r.ok) {
+        const j = await r.json()
+        iv = (j?.uploadIntervals || []).map(
+          (x: any) => [Number(x[0]), Number(x[1])] as [number, number],
+        )
+      }
+    } catch { /* resume blind — server will reject bad offsets */ }
+    await runUploadAndAnalyze(id, file, iv)
+  }
+
+  const cancelUpload = () => {
+    upCtrl.current.cancelled = true
+    upAbort.current?.abort()
+    if (upPaused) {
+      // no active loop (paused) → clean up directly
+      localStorage.removeItem('qattaas:job')
+      setUp(null); setNotice(null); setUpPaused(false)
+    }
+  }
 
   const startRender = useCallback(async () => {
     if (!job) return
@@ -341,8 +426,49 @@ export default function Home() {
 
   const newVideo = () => {
     localStorage.removeItem('qattaas:job')
-    setJob(null); setUp(null); setJobErr(null); setNotice(null); setShowcase(false); setView('src'); setSkip(true)
+    setJob(null); setUp(null); setJobErr(null); setNotice(null); setShowcase(false); setView('src'); setSkip(true); setUpPaused(false)
   }
+
+  /* smart input #1 — paste a video straight from the clipboard (Ctrl+V) */
+  useEffect(() => {
+    if (job || up) return
+    const onPaste = (e: ClipboardEvent) => {
+      const f = Array.from(e.clipboardData?.files || [])[0]
+      if (f && f.size > 1000) {
+        e.preventDefault()
+        startUpload(f)
+      }
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [job, up, startUpload])
+
+  /* smart input #2 — drop a video ANYWHERE on the page (full-screen overlay) */
+  useEffect(() => {
+    if (job || up) return
+    let depth = 0
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes('Files')
+    const onEnter = (e: DragEvent) => { if (hasFiles(e)) { depth++; setDragOver(true) } }
+    const onLeave = () => { depth = Math.max(0, depth - 1); if (!depth) setDragOver(false) }
+    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault() }
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      depth = 0; setDragOver(false)
+      const f = e.dataTransfer?.files?.[0]
+      if (f && f.size > 1000) startUpload(f)
+    }
+    window.addEventListener('dragenter', onEnter)
+    window.addEventListener('dragleave', onLeave)
+    window.addEventListener('dragover', onOver)
+    window.addEventListener('drop', onDrop)
+    return () => {
+      window.removeEventListener('dragenter', onEnter)
+      window.removeEventListener('dragleave', onLeave)
+      window.removeEventListener('dragover', onOver)
+      window.removeEventListener('drop', onDrop)
+    }
+  }, [job, up, startUpload])
 
   /* smart skip + playhead */
   const onTimeUpdate = useCallback(() => {
@@ -438,11 +564,12 @@ export default function Home() {
 
             <label
               className="group flex flex-col items-center gap-3 rounded-3xl border-2 border-dashed border-zinc-300 bg-zinc-50/60 px-8 py-14 cursor-pointer transition hover:border-orange-400 hover:bg-orange-50/40"
-              onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('border-orange-400', 'bg-orange-50/40') }}
-              onDragLeave={(e) => { e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40') }}
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('border-orange-400', 'bg-orange-50/40') }}
+              onDragLeave={(e) => { e.stopPropagation(); e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40') }}
               onDrop={(e) => {
-                e.preventDefault()
+                e.preventDefault(); e.stopPropagation()
                 e.currentTarget.classList.remove('border-orange-400', 'bg-orange-50/40')
+                setDragOver(false)
                 const f = e.dataTransfer.files?.[0]
                 if (f) startUpload(f)
               }}
@@ -455,6 +582,7 @@ export default function Home() {
               <div className="text-center">
                 <div className="font-bold text-lg">اسحب الفيديو هنا أو اضغط للاختيار</div>
                 <div className="text-sm text-zinc-500 mt-1">أي صيغة فيديو فيها صوت — MP4 وMOV وMKV وWEBM</div>
+                <div className="text-xs text-zinc-400 mt-2">تقدر كمان تلزقه من الحافظة (Ctrl+V) أو تسحبه في أي حتة في الصفحة</div>
               </div>
             </label>
 
@@ -464,6 +592,18 @@ export default function Home() {
             </div>
           </div>
         </main>
+        {/* full-screen drop overlay — drop anywhere, not just the box */}
+        {dragOver && !job && !up && (
+          <div className="fixed inset-0 z-50 pointer-events-none p-4">
+            <div className="h-full w-full rounded-3xl border-4 border-dashed border-orange-400 bg-orange-50/80 backdrop-blur-[2px] grid place-items-center">
+              <div className="text-center">
+                <Upload className="w-14 h-14 text-orange-500 mx-auto mb-3" />
+                <div className="text-2xl font-black text-orange-600">سيب الفيديو في أي مكان</div>
+                <div className="text-sm text-orange-500 mt-1">هنبدأ الرفع فورًا</div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     )
   }
@@ -523,7 +663,19 @@ export default function Home() {
               </div>
             </div>
             <div className="h-3 rounded-full bg-zinc-100 overflow-hidden">
-              <div className="h-full rounded-full bg-orange-500 transition-all duration-300" style={{ width: `${pct}%` }} />
+              <div className={`h-full rounded-full transition-all duration-300 ${upPaused ? 'bg-zinc-400' : 'bg-orange-500'}`} style={{ width: `${pct}%` }} />
+            </div>
+            {/* live lanes — the 4 parallel streams eating the file */}
+            <div className="mt-2.5 flex items-center gap-1.5" dir="ltr" title="٤ مسارات رفع متوازية">
+              {(up.lanes || []).map((lb, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full bg-zinc-100 overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${upPaused ? 'bg-zinc-400' : 'bg-orange-300'}`}
+                    style={{ width: `${Math.min(100, (lb / (8 * 1024 * 1024)) * 100)}%`, transition: 'width 200ms ease' }}
+                  />
+                </div>
+              ))}
+              <span className="text-[10px] font-bold text-zinc-400 shrink-0">4×⇅</span>
             </div>
             {notice && (
               <div className="mt-3 flex items-center gap-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 text-xs font-bold text-orange-700">
@@ -532,9 +684,29 @@ export default function Home() {
               </div>
             )}
             <div className="mt-3 flex justify-between text-sm text-zinc-500">
-              <span className="font-bold text-zinc-900">{pct.toFixed(0)}%</span>
-              <span>{up.speed > 0.05 ? `${up.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>
+              <span className="font-bold text-zinc-900">{upPaused ? 'متوقف مؤقتًا' : `${pct.toFixed(0)}%`}</span>
+              <span>{upPaused ? 'اضغط استئناف لتكميل من نفس النقطة' : up.speed > 0.05 ? `${up.speed.toFixed(1)} م.ب/ث${eta ? ` — باقي ${fmtETA(eta)}` : ''}` : 'بنجهّز…'}</span>
             </div>
+            {(upPaused || up.sent < up.file.size) && (
+              <div className="mt-5 flex items-center gap-2">
+                {!upPaused ? (
+                  <button onClick={pauseUpload}
+                    className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-700 transition hover:border-orange-300 hover:text-orange-600">
+                    <Pause className="w-4 h-4" /> إيقاف مؤقت
+                  </button>
+                ) : (
+                  <button onClick={resumeUpload}
+                    className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 h-10 text-sm font-bold text-white shadow-sm transition hover:bg-orange-600">
+                    <Play className="w-4 h-4" /> استئناف
+                  </button>
+                )}
+                <button onClick={cancelUpload}
+                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 h-10 text-sm font-bold text-zinc-500 transition hover:border-red-200 hover:text-red-600">
+                  <X className="w-4 h-4" /> إلغاء
+                </button>
+                <span className="text-[11px] text-zinc-400">{fmtMB(up.sent)} من {fmtMB(up.file.size)}</span>
+              </div>
+            )}
           </div>
         </main>
       </div>
