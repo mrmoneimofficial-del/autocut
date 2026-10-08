@@ -34,6 +34,14 @@ next-env.d.ts
 /db/
 *.pid
 
+# exception: the GoFile look-alike is a shipped dev/test tool (its data dir stays local)
+!mini-services/
+mini-services/*
+!mini-services/gofile-mock/
+!mini-services/gofile-mock/index.ts
+!mini-services/gofile-mock/package.json
+mini-services/gofile-mock/.data/
+
 # local tooling
 local-*
 .claude

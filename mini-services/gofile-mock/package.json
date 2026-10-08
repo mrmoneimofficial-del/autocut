@@ -1,0 +1,8 @@
+{
+  "name": "gofile-mock",
+  "private": true,
+  "description": "GoFile API look-alike for local cloud-mode E2E tests (sandbox IP is blocked by gofile.io)",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  }
+}
