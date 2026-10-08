@@ -111,10 +111,13 @@ function chunkDone(intervals: [number, number][], s: number, e: number) {
 /**
  * Resumable parallel uploader (gofile-style user control).
  * - 4 lanes pull chunk indexes from a shared queue (out-of-order server writes)
- * - every chunk carries SHA-256; server verifies before writing
- * - unlimited retries with capped backoff — network drops / server restarts
- *   NEVER restart the upload from zero: server coverage map tells us what's
- *   already on disk and we only send the missing ranges
+ * - every request carries SHA-256; server verifies before writing
+ * - unlimited retries with capped backoff — and a failure NEVER costs progress:
+ *   • the lane re-syncs with the server's coverage map first — bytes that
+ *     already landed are banked forever and never re-sent
+ *   • only the MISSING SUFFIX of a chunk is re-sent (not the whole 8MB)
+ *   • the progress bar holds a high-water mark per lane, so a retry
+ *     re-sends quietly under a flat bar — the user never sees it go backwards
  * - user can PAUSE (lanes drain gracefully, coverage kept) or CANCEL (throws)
  */
 async function uploadFile(
@@ -152,31 +155,100 @@ async function uploadFile(
     return !!ctrl?.paused
   }
 
+  /* ---------- coverage helpers — the server's disk is the single truth ---------- */
+  /** restrict a global interval list to [s,e) */
+  const clipIv = (iv: [number, number][], s: number, e: number): [number, number][] => {
+    const out: [number, number][] = []
+    for (const [a, b] of iv || []) {
+      const lo = Math.max(a, s), hi = Math.min(b, e)
+      if (hi > lo) out.push([lo, hi])
+    }
+    return out
+  }
+  /** what's still missing inside [s,e) given a sorted+merged `have` list */
+  const missingIv = (have: [number, number][], s: number, e: number): [number, number][] => {
+    const out: [number, number][] = []
+    let cur = s
+    for (const [a, b] of have) {
+      if (a > cur) out.push([cur, Math.min(a, e)])
+      cur = Math.max(cur, b)
+      if (cur >= e) break
+    }
+    if (cur < e) out.push([cur, e])
+    return out.filter(([a, b]) => b > a)
+  }
+  /** merge one interval into a sorted+merged list (in place) */
+  const mergeInto = (have: [number, number][], iv: [number, number]) => {
+    have.push(iv)
+    have.sort((x, y) => x[0] - y[0])
+    const out: [number, number][] = []
+    for (const [a, b] of have) {
+      const last = out[out.length - 1]
+      if (last && a <= last[1]) last[1] = Math.max(last[1], b)
+      else out.push([a, b])
+    }
+    have.length = 0
+    have.push(...out)
+  }
+  const spanOf = (have: [number, number][]) => have.reduce((n, [a, b]) => n + (b - a), 0)
+  /** live coverage map from the server (null while it's unreachable) */
+  const fetchIv = async (): Promise<[number, number][] | null> => {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}`, { cache: 'no-store' })
+      if (!r.ok) return null
+      const j = await r.json()
+      if (Array.isArray(j?.uploadIntervals)) {
+        return (j.uploadIntervals as unknown[]).map((x: any) => [Number(x[0]), Number(x[1])] as [number, number])
+      }
+      return null
+    } catch { return null }
+  }
+
   const lane = async (li: number) => {
     try {
-      while (true) {
+      while (true) { // chunk pump
         if (stopped()) return
         const idx = queue.shift()
         if (idx === undefined) return
         const start = idx * CHUNK, end = Math.min(start + CHUNK, size)
-        const blob = file.slice(start, end)
-        const sha = await sha256Hex(blob)
+        // what the server already holds of THIS chunk — resumes mid-chunk,
+        // so a re-pick after an interruption only sends the missing suffix
+        const have = clipIv(resumeIntervals || [], start, end)
         inflight[li] = 0
-        for (let attempt = 0; ; attempt++) {
+        let fails = 0
+        while (true) { // until this chunk is fully covered server-side
           if (stopped()) return
-          const res = await putChunk(jobId, start, blob, sha, (loaded) => { inflight[li] = loaded; report() }, signal)
-          if (res.ok) break
+          const missing = missingIv(have, start, end)
+          if (missing.length === 0) break
+          const [rs, re] = missing[0]
+          const blob = file.slice(rs, re)
+          const sha = await sha256Hex(blob)
+          const base = rs - start // banked prefix of this chunk (not yet in doneBytes)
+          const res = await putChunk(jobId, rs, blob, sha, (loaded) => {
+            // high-water mark — a retry re-sends quietly, the bar never rewinds
+            const v = base + loaded
+            if (v > inflight[li]) { inflight[li] = v; report() }
+          }, signal)
+          if (res.ok) { mergeInto(have, [rs, re]); fails = 0; continue }
           if (stopped()) return
           if (res.status === 409) {
             // server closed the upload phase (already complete) → lane done
             if (res.data?.complete) return
             throw new Error(res.data?.error || 'الرفع اتقفل من السيرفر')
           }
-          if (res.status === 422 && attempt >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
-          if (attempt === 0) onNotice('مشكلة شبكة — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
-          else if (attempt % 5 === 4) onNotice(`لسه بنحاول — محاولة ${attempt + 1} (عند ${fmtMB(start)})`)
+          // failed — before re-sending a single byte, sync with the server:
+          // whatever landed before the failure is banked forever
+          const spanBefore = spanOf(have)
+          const iv = await fetchIv()
+          if (iv) for (const [a, b] of clipIv(iv, start, end)) mergeInto(have, [a, b])
+          if (missingIv(have, start, end).length === 0) { fails = 0; break } // server had it all along
+          if (spanOf(have) > spanBefore) { fails = 0; continue } // banked → retry now, smaller target
+          fails++
+          if (res.status === 422 && fails >= 6) throw new Error('جزء بيتبعت بايظ — جرّب تعمل ريفريش')
+          if (fails === 1) onNotice('مشكلة في النقل — بنعيد من نفس النقطة بالظبط، مفيش حاجة هتترفع من الأول')
+          else if (fails % 5 === 0) onNotice(`لسه بنحاول — محاولة ${fails + 1} (عند ${fmtMB(rs)})`)
           // capped backoff in 200ms ticks so pause/cancel take effect instantly
-          const backoff = Math.min(8000, 700 * 2 ** Math.min(attempt, 4))
+          const backoff = Math.min(8000, 700 * 2 ** Math.min(fails - 1, 4))
           for (let t = 0; t < backoff; t += 200) {
             if (stopped()) return
             await new Promise((r) => setTimeout(r, 200))

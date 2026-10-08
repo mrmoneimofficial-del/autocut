@@ -559,7 +559,12 @@ function chunkCommands(plan, crf) {
     const X = Math.max(0, g[0][0] / fps - 0.5)
     const Y = Math.min(plan.durationMs / 1000 + 0.5, g[g.length - 1][1] / fps + 0.5)
     const rel = g.map(([fa, fb]) => [fa / fps - X, fb / fps - X])
-    const expr = balanced(rel.map(([a2, b2]) => `gte(t,${a2.toFixed(3)})*lt(t,${b2.toFixed(3)})`))
+    // full-precision boundaries (+ rounding guard): a 3-decimal toFixed here
+    // used to drop up to one boundary frame per window — with many cuts that
+    // drifted the video shorter than the sample-exact audio track and failed
+    // the A/V duration check. The 5e-4 guard covers double ULP noise and the
+    // 3-decimal rounding of the -ss seek point.
+    const expr = balanced(rel.map(([a2, b2]) => `gte(t,${(a2 - 5e-4).toPrecision(12)})*lt(t,${(b2 - 5e-4).toPrecision(12)})`))
     // bulletproof re-timing:
     //   settb  = lock the tick unit to the source timebase
     //   setpts = integer ticks per frame (float-free, no drift)
