@@ -313,6 +313,11 @@ export default function Home() {
   const runCloudCut = useCallback(async (ref: AssetRef) => {
     const ac = new AbortController()
     cloudAbort.current = ac
+    // auto-retry: on serverless, a cut request can land on a different warm
+    // instance than the one holding the warm /tmp copy of the original (the
+    // "download failed" error) — retrying usually lands on the right one
+    const MAX_TRIES = 3
+    for (let attempt = 1; ; attempt++) {
     setCloud({ phase: 'cutting', ref, cut: { stage: 'prep', pct: 0, text: 'بنجهّز المعالجة…' } })
     try {
       const r = await fetch('/api/cloud/cut', {
@@ -357,13 +362,22 @@ export default function Home() {
         }
       }
       if (!finished) {
-        setCloud((c) => (c && c.phase === 'cutting'
-          ? { ...c, phase: 'error', error: 'انقطع الاتصال بالمعالجة — لو الفيديو كبير جرّب نسخة أصغر أو النسخة الكاملة (كولاب/كودسبيسز)' }
-          : c))
+        throw new Error('انقطع الاتصال بالمعالجة — لو الفيديو كبير جرّب نسخة أصغر أو النسخة الكاملة (كولاب/كودسبيسز)')
       }
+      return // تم القص بنجاح
     } catch (e: any) {
       if (ac.signal.aborted) { setCloud(null); return }
-      setCloud((c) => ({ ...(c || { phase: 'cutting' as const }), phase: 'error' as const, error: e?.message || 'فشل القص' }))
+      const msg = e?.message || 'فشل القص'
+      const transient = attempt < MAX_TRIES &&
+        /تنزيل الفيديو من السحابة فشل|انقطع الاتصال بالمعالجة|معالجة سحابية تانية شغالة/.test(msg)
+      if (transient) {
+        setCloud((c) => c ? { ...c, cut: { stage: 'prep', pct: 0, text: `الطلب وصل لطرف سيرفر تاني — بنعيد المحاولة تلقائيًا (${attempt}/${MAX_TRIES - 1})…` } } : c)
+        await new Promise((r) => setTimeout(r, 1200))
+        continue
+      }
+      setCloud((c) => ({ ...(c || { phase: 'cutting' as const }), phase: 'error' as const, error: msg }))
+      return
+    }
     }
   }, [gapMs, thr, crf])
 
