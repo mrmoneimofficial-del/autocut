@@ -316,7 +316,7 @@ export default function Home() {
     // auto-retry: on serverless, a cut request can land on a different warm
     // instance than the one holding the warm /tmp copy of the original (the
     // "download failed" error) — retrying usually lands on the right one
-    const MAX_TRIES = 3
+    const MAX_TRIES = 4
     for (let attempt = 1; ; attempt++) {
     setCloud({ phase: 'cutting', ref, cut: { stage: 'prep', pct: 0, text: 'بنجهّز المعالجة…' } })
     try {

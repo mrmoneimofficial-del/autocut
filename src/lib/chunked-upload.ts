@@ -141,7 +141,7 @@ class FatalUploadError extends Error {}
  *  about our session — the attempt-restarter re-inits and pushes again */
 class SessionLostError extends Error {}
 /** how many times a lost session may be transparently re-established */
-const MAX_SESSION_LOSSES = 3
+const MAX_SESSION_LOSSES = 5
 /** silent cancel — the session stays on the server for resume */
 class CancelledError extends Error {
   constructor() { super('تم الإلغاء'); this.name = 'CancelledError' }
@@ -419,7 +419,7 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
             progress.status = 'retrying'
             progress.error = 'الرفع اتنقل لطرف سيرفر تاني — بنعيد التأسيس تلقائيًا'
             emit()
-            await sleep(700)
+            await sleep(1500)
             continue
           }
           throw e
