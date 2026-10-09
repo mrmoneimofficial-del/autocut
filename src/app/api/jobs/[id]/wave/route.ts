@@ -5,6 +5,7 @@ import { resolveBins } from '@/lib/cloud'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const HZ = 50          // one envelope sample per 20ms

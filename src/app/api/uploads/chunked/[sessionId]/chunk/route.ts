@@ -8,6 +8,7 @@ import {
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 /**
  * POST /api/uploads/chunked/:sessionId/chunk?start=S&len=L&c=checksum

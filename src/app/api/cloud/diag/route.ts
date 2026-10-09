@@ -6,6 +6,7 @@ import { bunnyConfigured, bunnyUrl } from '@/lib/bunny-storage'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 /**
  * GET /api/cloud/diag — one-shot health probe of the NEW upload/cut stack

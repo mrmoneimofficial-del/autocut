@@ -6,6 +6,7 @@ import { bunnyConfigured } from '@/lib/bunny-storage'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 

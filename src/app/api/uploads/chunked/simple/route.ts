@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import { EXT_OK, MAX_CHUNK_BODY, sessionDirOf, writeMeta, sweepSessions, type SessionMeta } from '@/lib/upload-session'
 import { finalizeUpload } from '@/lib/upload-finalize'
 
-export const maxDuration = 120
+export const maxDuration = 300
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 

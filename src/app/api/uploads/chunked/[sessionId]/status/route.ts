@@ -3,6 +3,7 @@ import { sessionDirOf, validSessionId, readMeta, bankedBytes, coverageComplete }
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 /**
  * GET /api/uploads/chunked/:sessionId/status — which BYTES already landed?

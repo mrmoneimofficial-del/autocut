@@ -8,6 +8,7 @@ import {
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 /**
  * POST /api/uploads/chunked/init — start a chunked upload session.

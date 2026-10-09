@@ -4,6 +4,7 @@ import { Readable } from 'node:stream'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 

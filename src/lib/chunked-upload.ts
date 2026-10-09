@@ -137,6 +137,11 @@ function rangeCovered(coverage: Range[], start: number, end: number): boolean {
 class RetryableError extends Error {}
 /** hard stop — message surfaces to the user */
 class FatalUploadError extends Error {}
+/** the serverless instance behind the connection changed and knows nothing
+ *  about our session — the attempt-restarter re-inits and pushes again */
+class SessionLostError extends Error {}
+/** how many times a lost session may be transparently re-established */
+const MAX_SESSION_LOSSES = 3
 /** silent cancel — the session stays on the server for resume */
 class CancelledError extends Error {
   constructor() { super('تم الإلغاء'); this.name = 'CancelledError' }
@@ -196,9 +201,17 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
 
   /** authoritative resync with the server — banked bytes are never re-sent */
   const resync = async () => {
-    const st = await api<{ bankedBytes?: number; coverage?: Range[]; complete?: boolean }>(
-      `${basePath}/${sessionId}/status`,
-    )
+    let st: { bankedBytes?: number; coverage?: Range[]; complete?: boolean }
+    try {
+      st = await api<{ bankedBytes?: number; coverage?: Range[]; complete?: boolean }>(
+        `${basePath}/${sessionId}/status`,
+      )
+    } catch (e: any) {
+      // 404 = this instance never saw the session (serverless scale-out /
+      // connection moved) — let the attempt-restarter rebuild it
+      if (e?.status === 404) throw new SessionLostError('الجلسة مش موجودة على الطرف الحالي')
+      throw e
+    }
     if (typeof st.bankedBytes === 'number') banked = st.bankedBytes
     if (Array.isArray(st.coverage)) coverage = st.coverage
     if (banked > hwm) hwm = banked // confirmed progress lifts the floor…
@@ -260,7 +273,7 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
             } catch { /* ignore */ }
             resolve() // treated as success-with-resync: the loop recomputes cursor
           } else if (xhr.status === 404) {
-            reject(new FatalUploadError('جلسة الرفع انتهت على السيرفر — ابدأ الرفع من جديد'))
+            reject(new SessionLostError('الجلسة مش موجودة على الطرف الحالي'))
           } else {
             let msg = `فشل رفع الجزء (${xhr.status})`
             try {
@@ -278,10 +291,12 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
     })
   }
 
-  const done = (async (): Promise<any | null> => {
-    try {
+  /** one full attempt: establish session → push missing bytes → merge on the
+   *  server. `fresh` skips the resume shortcut (the saved session was lost). */
+  const runUpload = async (fresh: boolean): Promise<any | null> => {
+    { // bare block keeps the historic indentation of the ported body
       // 1. Establish the session (reuse a saved one for this exact file)
-      if (opts.resume && opts.resume.fileName === file.name && opts.resume.fileSize === file.size) {
+      if (!fresh && opts.resume && opts.resume.fileName === file.name && opts.resume.fileSize === file.size) {
         sessionId = opts.resume.sessionId
         try {
           await resync() // session alive → continue where it stopped
@@ -334,6 +349,7 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
           progress.status = 'uploading'
           emit()
         } catch (e) {
+          if (e instanceof SessionLostError) throw e // restart via the attempt wrapper
           if (e instanceof FatalUploadError) {
             if (e.message === '__cancelled__' || e.message === '__paused__') return null
             throw e
@@ -368,11 +384,47 @@ export function createChunkedUpload(opts: UploadOpts): ChunkedUploadHandle {
       hwm = totalBytes
       emit()
 
-      const completeRes = await api<any>(`${basePath}/${sessionId}/complete`, { json: {} })
+      let completeRes: any
+      try {
+        completeRes = await api<any>(`${basePath}/${sessionId}/complete`, { json: {} })
+      } catch (e: any) {
+        if (e?.status === 404) throw new SessionLostError('الجلسة مش موجودة على الطرف الحالي')
+        throw e
+      }
       finished = true
       progress.status = 'done'
       emit()
       return completeRes
+    }
+  }
+
+  const done = (async (): Promise<any | null> => {
+    try {
+      let losses = 0
+      for (;;) {
+        try {
+          return await runUpload(losses > 0)
+        } catch (e) {
+          if (e instanceof SessionLostError && !cancelled && ++losses <= MAX_SESSION_LOSSES) {
+            // the connection landed on a different serverless instance —
+            // rebuild the session and push everything again (the display
+            // bar never rewinds, so this is invisible apart from a short
+            // "retrying" blip)
+            sessionId = null
+            banked = 0
+            coverage = []
+            chunkSize = INITIAL_CHUNK
+            ceiling = MAX_CHUNK
+            successStreak = 0
+            progress.status = 'retrying'
+            progress.error = 'الرفع اتنقل لطرف سيرفر تاني — بنعيد التأسيس تلقائيًا'
+            emit()
+            await sleep(700)
+            continue
+          }
+          throw e
+        }
+      }
     } catch (e: any) {
       if (cancelled) return null
       progress.status = 'error'

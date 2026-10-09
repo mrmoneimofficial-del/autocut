@@ -5,6 +5,7 @@ import { signPathToken } from '@/lib/storage-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const RUNNER = path.join(process.cwd(), 'scripts', 'pipeline-runner.mjs')
