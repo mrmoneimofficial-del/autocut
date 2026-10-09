@@ -18,6 +18,9 @@ next-env.d.ts
 # env files — never commit
 .env*
 
+# secrets — tokens/credentials, never commit
+.secrets/
+
 # vercel
 .vercel
 
