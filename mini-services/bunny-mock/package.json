@@ -1,0 +1,8 @@
+{
+  "name": "bunny-mock",
+  "private": true,
+  "description": "Bunny.net Storage look-alike for local E2E tests of the مستر منعم upload system (sandbox has no Bunny account)",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  }
+}

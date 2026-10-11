@@ -14,7 +14,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'storage', 'jobs')
+// QATTAAS_JOBS_ROOT — cloud mode (api/cloud/cut) points the runner at an
+// ephemeral /tmp job dir instead of the persistent ./storage/jobs tree.
+const ROOT = process.env.QATTAAS_JOBS_ROOT
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'storage', 'jobs')
+
+// FFMPEG_PATH / FFPROBE_PATH — serverless hosts (Vercel…) have no system
+// ffmpeg; the API route resolves ffmpeg-static/ffprobe-static and passes the
+// absolute binary paths here.
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg'
+const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe'
 
 const AR = {
   scanning: 'نمسح الصمت ونحدد الفجوات…',
@@ -23,7 +32,7 @@ const AR = {
   muxing: 'نجمّع الملف النهائي…',
   verifying: 'نتأكد من الملف النهائي…',
   cleanup: 'ننظف الملفات المؤقتة…',
-  mirroring: 'نحفظ نسخة خارجية من النتيجة…',
+  mirroring: 'نحفظ النتيجة على التخزين السحابي…',
   done: 'خلصنا! 🎉',
 }
 
@@ -66,7 +75,7 @@ function progress(p) {
 /** run ffmpeg, capture stderr, resolve on exit 0 */
 function ff(args, { onStderr } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn('ffmpeg', ['-nostdin', '-y', '-hide_banner', ...args], {
+    const p = spawn(FFMPEG, ['-nostdin', '-y', '-hide_banner', ...args], {
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     let err = ''
@@ -82,7 +91,7 @@ function ff(args, { onStderr } = {}) {
 
 function probe(file) {
   return new Promise((resolve, reject) => {
-    const p = spawn('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file])
+    const p = spawn(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file])
     let out = ''
     p.stdout.on('data', (d) => (out += d))
     p.on('close', (code) => {
@@ -94,19 +103,19 @@ function probe(file) {
 }
 
 // ---------------------------------------------------------------- scan + plan
-async function scanAndPlan(settings) {
-  const { gapMs, thresholdDb } = settings
+/** probe the source once — shared by every planning path */
+async function probeMeta() {
   const info = await probe(src)
   const v = info.streams.find((s) => s.codec_type === 'video')
   const a = info.streams.find((s) => s.codec_type === 'audio')
   if (!a) throw new Error('NO_AUDIO')
+  if (!v) throw new Error('NO_VIDEO')
   const [num, den] = v.r_frame_rate.split('/').map(Number)
   const fps = num / (den || 1)
   const duration = parseFloat(info.format.duration)
   const sr = parseInt(a.sample_rate, 10)
   const ch = a.channels
   const totalFrames = Math.max(1, Math.round(duration * fps))
-
   const meta = {
     durationMs: Math.round(duration * 1000),
     fps: Math.round(fps * 1000) / 1000,
@@ -114,6 +123,26 @@ async function scanAndPlan(settings) {
     vcodec: v.codec_name, acodec: a.codec_name,
     sr, ch, size: parseInt(info.format.size, 10),
   }
+  const [tbNum, tbDen] = (v.time_base || '1/90000').split('/').map(Number)
+  const ticksPerFrame = Math.round((tbDen * den) / (tbNum * num))
+  const frameGrid = {
+    fps, totalFrames, tbNum, tbDen, ticksPerFrame, fpsNum: num, fpsDen: den,
+    ticksInt: Math.abs((tbDen * den) / (tbNum * num) - ticksPerFrame) < 1e-9,
+  }
+  return { meta, frameGrid, duration, fps, totalFrames }
+}
+
+/** plan summary that lands in job.json (what the UI displays) */
+function planSummary(plan) {
+  return {
+    settings: plan.settings, durationMs: plan.durationMs, keptMs: plan.keptMs,
+    savedMs: plan.savedMs, cutsCount: plan.cutsCount, cuts: plan.cuts,
+  }
+}
+
+async function scanAndPlan(settings) {
+  const { gapMs, thresholdDb } = settings
+  const { meta, frameGrid, duration, fps, totalFrames } = await probeMeta()
 
   // -- silencedetect (audio-only, min duration = gap) --
   let stderr = ''
@@ -134,10 +163,7 @@ async function scanAndPlan(settings) {
 
   // -- frame-grid plan: keep `gap` of every silence longer than gap --
   const keepSec = gapMs / 1000
-  const [tbNum, tbDen] = (v.time_base || '1/90000').split('/').map(Number)
-  const [fpsNum, fpsDen] = [num, den]
-  // ticks per frame in the source timebase (integer for all sane files)
-  const ticksPerFrame = Math.round((tbDen * fpsDen) / (tbNum * fpsNum))
+  const { tbNum, tbDen, ticksPerFrame, fpsNum, fpsDen, ticksInt } = frameGrid
   const windows = []   // [fa, fb) frame indices kept
   const cuts = []      // [ms, ms] removed spans (original timeline, for preview)
   let cur = 0
@@ -155,9 +181,8 @@ async function scanAndPlan(settings) {
 
   const keptFrames = windows.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
   const plan = {
-    settings, fps, sr, ch, totalFrames, tbNum, tbDen, ticksPerFrame,
-    fpsNum, fpsDen,
-    ticksInt: Math.abs((tbDen * fpsDen) / (tbNum * fpsNum) - ticksPerFrame) < 1e-9,
+    settings, fps, sr: meta.sr, ch: meta.ch, totalFrames, tbNum, tbDen, ticksPerFrame,
+    fpsNum, fpsDen, ticksInt,
     durationMs: meta.durationMs,
     keptMs: Math.round(keptFrames * 1000 / fps),
     savedMs: Math.round(savedMs),
@@ -165,10 +190,55 @@ async function scanAndPlan(settings) {
     cuts, windows,
   }
   writeJSON(planFile, plan)
-  setPhase('ready', { meta, plan: {
-    settings, durationMs: meta.durationMs, keptMs: plan.keptMs, savedMs: plan.savedMs,
-    cutsCount: cuts.length, cuts,
-  } })
+  setPhase('ready', { meta, plan: planSummary(plan) })
+  return { plan, meta }
+}
+
+/** EXPLICIT montage plan — the browser detected + hand-tuned the cuts on the
+ *  audio envelope (dragging boundaries, excluding gaps) and sent the exact
+ *  list; the render then matches the live preview 1:1. */
+async function planFromCuts(settings) {
+  const raw = Array.isArray(settings.cuts) ? settings.cuts : []
+  const cuts = []
+  for (const c of raw) {
+    if (!Array.isArray(c) || c.length < 2) continue
+    const s = Math.max(0, Math.round(Number(c[0]) || 0))
+    const e = Math.round(Number(c[1]) || 0)
+    if (e - s < 20) continue
+    const last = cuts[cuts.length - 1]
+    if (last && s <= last[1] + 1) last[1] = Math.max(last[1], e)
+    else cuts.push([s, e])
+  }
+  if (!cuts.length) throw new Error('NO_CUTS')
+
+  const { meta, frameGrid, fps, totalFrames } = await probeMeta()
+  const { tbNum, tbDen, ticksPerFrame, fpsNum, fpsDen, ticksInt } = frameGrid
+  const windows = []
+  let cur = 0
+  let savedMs = 0
+  for (const [sMs, eMs] of cuts) {
+    const keepEndF = Math.floor((sMs / 1000) * fps)
+    const resumeF = Math.ceil((eMs / 1000) * fps)
+    if (keepEndF - cur > 1) windows.push([cur, keepEndF])
+    savedMs += (resumeF - keepEndF) * 1000 / fps
+    cur = Math.max(cur, resumeF)
+  }
+  if (totalFrames - cur > 1) windows.push([cur, totalFrames])
+  const keptFrames = windows.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
+  const plan = {
+    settings, fps, sr: meta.sr, ch: meta.ch, totalFrames, tbNum, tbDen, ticksPerFrame,
+    fpsNum, fpsDen, ticksInt,
+    durationMs: meta.durationMs,
+    keptMs: Math.round(keptFrames * 1000 / fps),
+    savedMs: Math.round(savedMs),
+    cutsCount: cuts.length,
+    cuts, windows,
+  }
+  writeJSON(planFile, plan)
+  // refresh the plan summary in job.json WITHOUT touching the current phase
+  const j = JSON.parse(fs.readFileSync(jobFile, 'utf8'))
+  j.plan = planSummary(plan)
+  writeJSON(jobFile, j)
   return { plan, meta }
 }
 
@@ -190,7 +260,19 @@ async function getPlan(settings) {
 }
 
 // ---------------------------------------------------------------- audio
-/** Stream: decode PCM | slice keep-ranges | AAC encode. Sample-accurate, zero temp. */
+/**
+ * Stream: decode → slice keep-ranges → AAC encode.
+ * v2 (file-based): the old child-stdin pipe version silently truncated the
+ * AAC track on long videos with many cuts (a 53-min/1056-cut render produced
+ * 349s of audio from 370MB of sliced PCM — the encoder consumed only what
+ * sat in the pipe buffer). This version hands everything through files:
+ *   full.pcm  — complete mono/stereo PCM decode of the source
+ *   sliced.pcm— exact byte ranges of the kept windows (fs readSync/writeSync,
+ *               deterministic, zero event-loop plumbing)
+ *   audio.m4a — AAC 96k encoded from the file
+ * Sample-accuracy is identical to v1 (same ranges math). Disk cost ≈ 2× the
+ * raw PCM of the source audio — fine under the 200MB cloud input cap.
+ */
 async function buildAudio(plan, onByte) {
   const { windows, fps, sr, ch } = plan
   const frameSize = ch * 2
@@ -202,315 +284,108 @@ async function buildAudio(plan, onByte) {
   const totalOut = ranges.reduce((n, [a2, b2]) => n + (b2 - a2), 0)
   onByte(0, totalOut) // initial tick so callers learn the target size immediately
 
-  const dec = spawn('ffmpeg', ['-nostdin', '-hide_banner', '-i', src, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', 'pipe:1'], { stdio: ['ignore', 'pipe', 'ignore'] })
-  const enc = spawn('ffmpeg', ['-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sr), '-ac', String(ch), '-i', 'pipe:0', '-c:a', 'aac', '-b:a', '96k', path.join(dir, 'audio.m4a')], { stdio: ['pipe', 'ignore', 'pipe'] })
+  // -- 1. full decode to file --
+  const fullPcm = path.join(dir, 'full.pcm')
+  await ff(['-i', src, '-vn', '-f', 's16le', '-acodec', 'pcm_s16le', fullPcm])
 
-  let encErr = ''
-  enc.stderr.on('data', (d) => (encErr += d.toString()))
-
-  let pos = 0        // absolute byte position in decoded stream
-  let ri = 0         // current range index
-  let written = 0
-  let failed = null
-  let lastTick = 0
-  dec.on('error', (e) => { failed = e; enc.stdin.end() })
-  enc.on('error', (e) => { failed = e; dec.kill() })
-  // backpressure: pause the decoder whenever the AAC encoder can't keep up
-  enc.stdin.on('drain', () => { if (!failed) dec.stdout.resume() })
-
-  await new Promise((resolve, reject) => {
-    dec.stdout.on('data', (chunk) => {
-      if (failed) return
-      const absStart = pos, absEnd = pos + chunk.length
-      let canAccept = true
-      while (ri < ranges.length) {
-        const [rs, re] = ranges[ri]
-        if (absEnd <= rs) break                     // wait for more data
-        if (absStart >= re) { ri++; continue }      // range passed
-        const from = Math.max(rs, absStart) - absStart
-        const to = Math.min(re, absEnd) - absStart
-        if (to > from) {
-          canAccept = enc.stdin.write(chunk.subarray(from, to))
-          written += to - from
-        }
-        if (absEnd >= re) ri++
-        else break
+  // -- 2. deterministic sync slicing (no pipes, no events) --
+  const slicedPcm = path.join(dir, 'sliced.pcm')
+  {
+    const fd = fs.openSync(fullPcm, 'r')
+    const wfd = fs.openSync(slicedPcm, 'w')
+    const buf = Buffer.alloc(1 << 20)
+    let written = 0
+    let lastTick = 0
+    for (const [rs, re] of ranges) {
+      let p = rs
+      while (p < re) {
+        const n = Math.min(buf.length, re - p)
+        fs.readSync(fd, buf, 0, n, p)
+        fs.writeSync(wfd, buf, 0, n)
+        written += n
+        p += n
       }
-      pos = absEnd
-      if (onByte && written - lastTick > 4000000) { lastTick = written; onByte(written, totalOut) }
-      if (!canAccept && !failed) dec.stdout.pause()
-    })
-    dec.stdout.on('end', () => enc.stdin.end())
-    dec.on('close', (code) => { if (code !== 0 && !failed) { failed = new Error('audio decode exit ' + code); enc.stdin.end() } })
-    enc.on('close', (code) => {
-      if (failed || code !== 0) reject(failed || new Error('aac encode exit ' + code + ' ' + encErr))
-      else resolve()
-    })
-    dec.on('error', reject); enc.on('error', reject)
-  })
-  return { written, totalOut }
+      if (onByte && written - lastTick > 4_000_000) { lastTick = written; onByte(written, totalOut) }
+    }
+    fs.closeSync(fd)
+    fs.closeSync(wfd)
+    if (Math.abs(written - totalOut) > 48000) {
+      fs.rmSync(fullPcm, { force: true })
+      fs.rmSync(slicedPcm, { force: true })
+      throw new Error(`audio slice mismatch ${written}!=${totalOut}`)
+    }
+    fs.rmSync(fullPcm, { force: true }) // full decode no longer needed
+  }
+
+  // -- 3. AAC encode from file --
+  await ff(['-f', 's16le', '-ar', String(sr), '-ac', String(ch), '-i', slicedPcm,
+    '-c:a', 'aac', '-b:a', '96k', path.join(dir, 'audio.m4a')])
+  fs.rmSync(slicedPcm, { force: true })
+  return { written: totalOut, totalOut }
 }
 
-// ---------------------------------------------------------------- gofile mirror
+// --------------------------------------------------------- bunny storage mirror
 /**
- * Best-effort mirror of the final file to GoFile (free file host) so the
- * download link survives ephemeral hosts (Colab session end, container
- * restarts). Never throws — returns { url } on success, null otherwise.
- * Disable with env GOFILE_MIRROR=0.
+ * Upload the final file to Bunny Storage (the مستر منعم upload system's
+ * storage layer) so the result survives ephemeral hosts. The file lands in
+ * the SAME session folder as the original (uploads/<sid>/result-<stamp>.mp4)
+ * and the API route signs a delivery token for it. Never throws —
+ * returns { path, size } on success, null otherwise.
+ * Env: BUNNY_STORAGE_ZONE, BUNNY_STORAGE_PASSWORD (+ optional
+ * BUNNY_STORAGE_HOST override for self-hosted/test setups),
+ * QATTAAS_RESULT_DIR (cloud mode passes the original's session folder).
  */
-async function mirrorToGoFile(file, name) {
-  if (process.env.GOFILE_MIRROR === '0') return null
-  // GOFILE_API (advanced): point the mirror at another GoFile-compatible API —
-  // used for testing/self-hosting. Server entries containing ':' are treated as
-  // absolute origins (e.g. http://localhost:9876); plain names get .gofile.io.
-  const API_BASE = process.env.GOFILE_API || 'https://api.gofile.io'
-  const cacheFile = path.join(ROOT, '..', '.gofile.json')
-  const jGet = async (url, opts) => {
-    const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30_000) })
-    const j = await r.json().catch(() => null)
-    if (!j || j.status !== 'ok') throw new Error(`gofile api ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
-    return j.data
-  }
-  try {
-    let { token, server } = (() => {
-      try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')) } catch { return {} }
-    })()
-    if (!token) {
-      const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
-      token = acc.token
-    }
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (!server) {
-        const d = await jGet(`${API_BASE}/servers`)
-        const servers = (d.servers || []).map((s) => s.name).filter(Boolean)
-        if (!servers.length) throw new Error('no gofile servers available')
-        server = servers[Math.floor(Math.random() * servers.length)]
-      }
-      try {
-        // stream from disk when the runtime supports it; fall back to a buffer
-        let blob
-        try { blob = await fs.promises.openAsBlob(file) }
-        catch { blob = new Blob([await fs.promises.readFile(file)]) }
-        const fd = new FormData()
-        fd.append('file', blob, name)
-        fd.append('token', token)
-        const origin = /^[a-z0-9.-]+$/i.test(server) ? `https://${server}.gofile.io` : `http://${server}`
-        const r = await fetch(`${origin}/contents/uploadfile`, {
-          method: 'POST', body: fd, signal: AbortSignal.timeout(30 * 60_000),
-        })
-        const j = await r.json().catch(() => null)
-        if (!j || j.status !== 'ok') throw new Error(`upload failed ${r.status} ${JSON.stringify(j).slice(0, 200)}`)
-        try { fs.writeFileSync(cacheFile, JSON.stringify({ token, server })) } catch { /* cache is best-effort */ }
-        logStd(`gofile: mirrored to ${j.data.downloadPage} (${server})`)
-        return { url: j.data.downloadPage }
-      } catch (e) {
-        logStd(`gofile attempt ${attempt + 1} on ${server} failed: ${e.message}`)
-        server = null
-        // token may be stale → fresh guest account for the retry
-        if (attempt === 0) {
-          try {
-            const acc = await jGet(`${API_BASE}/accounts`, { method: 'POST' })
-            token = acc.token
-          } catch (e2) { logStd(`gofile token refresh failed: ${e2.message}`) }
-        }
-      }
-    }
-    return null
-  } catch (e) {
-    logStd(`gofile mirror skipped: ${e.message}`)
+async function mirrorToBunnyStorage(file) {
+  const zone = String(process.env.BUNNY_STORAGE_ZONE || 'qattaas').trim()
+  const password = String(process.env.BUNNY_STORAGE_PASSWORD || '').trim()
+  if (!password) {
+    logStd('storage: skipped (BUNNY_STORAGE_PASSWORD not configured)')
     return null
   }
-}
-
-// ---------------------------------------------------------------- bunny stream mirror
-/** best direct-MP4 URL for a Bunny video (needs BUNNY_CDN_HOST + resolutions) */
-function bunnyBestMp4(guid, resos) {
-  const cdn = String(process.env.BUNNY_CDN_HOST || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '')
-  if (!cdn || !resos) return null
-  const best = String(resos).split(',').map((r) => parseInt(r, 10)).filter((n) => n > 0).sort((a, b) => b - a)[0]
-  return best ? `https://${cdn}/${guid}/play_${best}p.mp4` : null
-}
-/** Stream zones block referer-less requests — verify with the embed page as referer */
-async function bunnyMp4Works(mp4, referer) {
+  const dirBase = String(process.env.QATTAAS_RESULT_DIR || `uploads/${jobId}`).replace(/\/+$/, '')
+  const remotePath = `${dirBase}/result-${Date.now().toString(36)}.mp4`
+  const hostRaw = String(process.env.BUNNY_STORAGE_HOST || 'storage.bunnycdn.com').replace(/\/+$/, '')
+  const base = hostRaw.startsWith('http') ? `${hostRaw}/${zone}` : `https://${hostRaw}/${zone}`
   try {
-    const h = await fetch(mp4, { method: 'HEAD', headers: { referer }, signal: AbortSignal.timeout(20_000) })
-    if (h.ok) return true
-    logStd(`bunny: mp4 HEAD ${h.status} — dropping direct link`)
-  } catch { /* network hiccup → treat as unavailable */ }
-  return false
-}
-
-/**
- * Best-effort mirror of the final file to Bunny Stream (paid CDN, survives
- * everything, gives a hosted player page). Preferred over GoFile when
- * configured. Needs:
- *   BUNNY_STREAM_LIBRARY_ID — the numeric library id (Stream → library → API)
- *   BUNNY_STREAM_API_KEY    — the library API key (UUID)
- *   BUNNY_STREAM_API_KEY_ALT — optional second key to try (same library)
- *   BUNNY_CDN_HOST — optional library CDN host (e.g. vz-xxx.b-cdn.net): enables a
- *     direct MP4 link (best encoded resolution). Note: Stream zones block
- *     referer-less requests, so that link is meant to be CLICKED from a page
- *     (e.g. our UI) — the embed player link always works everywhere.
- *   BUNNY_API_BASE / BUNNY_EMBED_BASE — overrides for testing/self-hosting
- * Never throws — returns { url, guid, mp4? } on success, null otherwise.
- */
-async function mirrorToBunnyStream(file, name) {
-  const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
-  if (!libId || !/^\d+$/.test(libId)) return null
-  const keys = [process.env.BUNNY_STREAM_API_KEY, process.env.BUNNY_STREAM_API_KEY_ALT]
-    .map((k) => String(k || '').trim()).filter(Boolean)
-  if (!keys.length) return null
-
-  const API = (process.env.BUNNY_API_BASE || 'https://video.bunnycdn.com').replace(/\/$/, '')
-  const EMBED = (process.env.BUNNY_EMBED_BASE || 'https://iframe.mediadelivery.net/embed').replace(/\/$/, '')
-
-  const jReq = async (path, key, opts = {}) => {
-    const r = await fetch(`${API}/library/${libId}${path}`, {
-      ...opts,
-      headers: { AccessKey: key, accept: 'application/json', ...(opts.headers || {}) },
-      signal: opts.signal || AbortSignal.timeout(60_000),
-    })
-    const j = await r.json().catch(() => null)
-    if (!r.ok) throw new Error(`bunny ${path.split('?')[0]} ${r.status} ${JSON.stringify(j).slice(0, 160)}`)
-    return j
-  }
-
-  try {
-    // 1. create the video entry (try each configured key)
-    let key = null
-    let created = null
-    let lastErr = null
-    for (const k of keys) {
-      try {
-        created = await jReq('/videos', k, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: name }) })
-        key = k
-        break
-      } catch (e) { lastErr = e }
-    }
-    if (!created) throw lastErr || new Error('bunny create failed')
-    const guid = created.guid || created.videoGuid || created.id || (created.data && (created.data.guid || created.data.id))
-    if (!guid || typeof guid !== 'string') throw new Error(`bunny create returned no guid: ${JSON.stringify(created).slice(0, 160)}`)
-
-    // 2. upload the bytes (stream from disk when possible)
-    let blob
-    try { blob = await fs.promises.openAsBlob(file) }
-    catch { blob = new Blob([await fs.promises.readFile(file)]) }
-    const up = await fetch(`${API}/library/${libId}/videos/${guid}`, {
+    mirrorStageText = `${AR.mirroring}`
+    progress({ phase: 'mirroring', stage: mirrorStageText, pct: 99 })
+    // stream from disk when the runtime supports it; fall back to a buffer
+    let body
+    try { body = await fs.promises.openAsBlob(file) }
+    catch { body = new Blob([await fs.promises.readFile(file)]) }
+    const r = await fetch(`${base}/${remotePath}`, {
       method: 'PUT',
-      headers: { AccessKey: key, 'content-type': 'application/octet-stream' },
-      body: blob,
-      signal: AbortSignal.timeout(60 * 60_000),
+      headers: { AccessKey: password, 'Content-Type': 'application/octet-stream' },
+      body,
+      signal: AbortSignal.timeout(30 * 60_000),
     })
-    if (!up.ok) throw new Error(`bunny upload ${up.status} ${(await up.text().catch(() => '')).slice(0, 160)}`)
-
-    // 3. short encode poll — status 4 = finished, availableResolutions = MP4s
-    //    ready. If the encode queue is slow we don't block `done`: the embed
-    //    link works on its own and a post-done catch-up adds the MP4 link later.
-    let status = -1
-    let resos = null
-    let last = null
-    for (let i = 0; i < 6; i++) {
-      await new Promise((r) => setTimeout(r, i === 0 ? 4000 : 12000))
-      try {
-        last = await jReq(`/videos/${guid}`, key)
-        status = Number(last.status ?? -1)
-        resos = last.availableResolutions || null
-        const ep = Math.round(Number(last.encodeProgress ?? 0))
-        if (ep > 0 && ep < 100) {
-          mirrorStageText = `${AR.mirroring} (ترميز Bunny ${ep}%)`
-          progress({ phase: 'mirroring', stage: mirrorStageText, pct: 99 })
-        }
-        if (status === 4 || resos) break
-        if (status === 5 || status === 6) throw new Error(`bunny encode status ${status}`)
-      } catch (e) {
-        if (String(e.message).includes('status 5') || String(e.message).includes('status 6')) throw e
-        // transient poll failure → keep waiting
-      }
-    }
-    const embed = last && last.iframeSrc ? `https:${last.iframeSrc}` : `${EMBED}/${libId}/${guid}`
-    let mp4 = bunnyBestMp4(guid, resos)
-    if (mp4 && !(await bunnyMp4Works(mp4, embed))) mp4 = null
-    logStd(`bunny: mirrored ${guid} (encode status ${status}${mp4 ? ', mp4 ready' : ''})`)
-    return { url: embed, guid, ...(mp4 ? { mp4 } : {}) }
+    if (!r.ok) throw new Error(`PUT ${r.status} ${(await r.text().catch(() => '')).slice(0, 160)}`)
+    const size = fs.statSync(file).size
+    logStd(`storage: result saved at ${remotePath} (${size} bytes)`)
+    return { path: remotePath, size }
   } catch (e) {
-    logStd(`bunny mirror failed: ${e.message}`)
+    logStd(`storage mirror failed: ${e.message}`)
     return null
   }
 }
 
-/** after `done`: if the encode queue was slow, keep polling for the finished
- *  encode and return the direct MP4 link (bounded ~8 min, never throws). */
-async function catchUpBunnyMp4(bunny) {
-  try {
-    const libId = String(process.env.BUNNY_STREAM_LIBRARY_ID || '').trim()
-    const key = String(process.env.BUNNY_STREAM_API_KEY || process.env.BUNNY_STREAM_API_KEY_ALT || '').trim()
-    if (!libId || !/^\d+$/.test(libId) || !key || !bunny.guid) return null
-    const API = (process.env.BUNNY_API_BASE || 'https://video.bunnycdn.com').replace(/\/$/, '')
-    let headFails = 0
-    for (let i = 0; i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 12_000))
-      try {
-        const r = await fetch(`${API}/library/${libId}/videos/${bunny.guid}`, {
-          headers: { AccessKey: key, accept: 'application/json' },
-          signal: AbortSignal.timeout(30_000),
-        })
-        if (!r.ok) continue
-        const v = await r.json().catch(() => null)
-        const mp4 = bunnyBestMp4(bunny.guid, v && v.availableResolutions)
-        if (!mp4) continue
-        // the MP4 file can lag a few seconds behind the resolutions metadata
-        // (transient 404 on the edge) → keep polling instead of giving up
-        if (await bunnyMp4Works(mp4, bunny.url)) return mp4
-        if (++headFails >= 5) return null // MP4 access genuinely unavailable
-      } catch { /* transient → keep waiting */ }
-    }
-    return null
-  } catch { return null }
-}
-
-/** output is on disk → mirror it externally → finish. Download stays available
- *  during the mirror (the UI shows the button from phase 'mirroring'). */
-let mirrorStageText = null // live stage text while a mirror uploads/polls
+/** output is on disk → upload it to Bunny Storage → finish. Download stays
+ *  available during the upload (the UI shows the button from phase 'mirroring'). */
+let mirrorStageText = null // live stage text while the storage upload runs
 
 async function finish(outPath, output) {
-  // drop stale mirror links from a previous render of the same job
-  setPhase('mirroring', { output, gofile: undefined, bunny: undefined })
+  // drop stale storage links from a previous render of the same job
+  setPhase('mirroring', { output, storage: undefined })
   mirrorStageText = null
   progress({ phase: 'mirroring', stage: AR.mirroring, pct: 99 })
   // heartbeat so the API stall-detector (10 min) never kills a long upload
   const hb = setInterval(() => {
     try { progress({ phase: 'mirroring', stage: mirrorStageText || AR.mirroring, pct: 99 }) } catch { /* shutting down */ }
   }, 15_000)
-  const base = String(job.name || 'video').replace(/\.[^.]+$/, '') || 'video'
-  const outName = `${base}-qattaas.mp4`
-  // Bunny Stream first (permanent CDN + player); GoFile as fallback
-  let ext = await mirrorToBunnyStream(outPath, outName)
-  let extField = ext ? { bunny: ext } : null
-  if (!ext) {
-    ext = await mirrorToGoFile(outPath, outName)
-    extField = ext ? { gofile: ext } : null
-  }
+  const ext = await mirrorToBunnyStorage(outPath)
   clearInterval(hb)
-  setPhase('done', extField || {})
+  setPhase('done', ext ? { storage: ext } : {})
   progress({ phase: 'done', stage: AR.done, pct: 100 })
-  // post-done catch-up: slow Bunny encode queue → add the direct MP4 link when
-  // it appears; the UI picks it up on its next status poll (it keeps polling
-  // at `done`). Only writes if this guid is still the live one (re-render safe).
-  if (extField && extField.bunny && !extField.bunny.mp4) {
-    const mp4 = await catchUpBunnyMp4(extField.bunny)
-    if (mp4) {
-      try {
-        const j = JSON.parse(fs.readFileSync(jobFile, 'utf8'))
-        if (j.phase === 'done' && j.bunny && j.bunny.guid === extField.bunny.guid) {
-          j.bunny.mp4 = mp4
-          writeJSON(jobFile, j)
-          logStd(`bunny: mp4 link added post-done (${mp4})`)
-        }
-      } catch { /* best-effort */ }
-    } else {
-      logStd('bunny: mp4 catch-up ended without a link (encode too slow or blocked)')
-    }
-  }
 }
 
 // ---------------------------------------------------------------- video chunks
@@ -541,7 +416,12 @@ function chunkCommands(plan, crf) {
     const X = Math.max(0, g[0][0] / fps - 0.5)
     const Y = Math.min(plan.durationMs / 1000 + 0.5, g[g.length - 1][1] / fps + 0.5)
     const rel = g.map(([fa, fb]) => [fa / fps - X, fb / fps - X])
-    const expr = balanced(rel.map(([a2, b2]) => `gte(t,${a2.toFixed(3)})*lt(t,${b2.toFixed(3)})`))
+    // full-precision boundaries (+ rounding guard): a 3-decimal toFixed here
+    // used to drop up to one boundary frame per window — with many cuts that
+    // drifted the video shorter than the sample-exact audio track and failed
+    // the A/V duration check. The 5e-4 guard covers double ULP noise and the
+    // 3-decimal rounding of the -ss seek point.
+    const expr = balanced(rel.map(([a2, b2]) => `gte(t,${(a2 - 5e-4).toPrecision(12)})*lt(t,${(b2 - 5e-4).toPrecision(12)})`))
     // bulletproof re-timing:
     //   settb  = lock the tick unit to the source timebase
     //   setpts = integer ticks per frame (float-free, no drift)
@@ -588,7 +468,9 @@ async function render(settings) {
   setPhase('rendering')
   progress({ phase: 'rendering', stage: AR.scanning, pct: 2 })
 
-  const { plan } = await getPlan({ gapMs, thresholdDb })
+  const { plan } = settings.cuts
+    ? await planFromCuts(settings)
+    : await getPlan({ gapMs, thresholdDb })
   logStd(`plan: cuts=${plan.cutsCount} kept=${plan.keptMs}ms saved=${plan.savedMs}ms`)
 
   const outPath = path.join(dir, 'out.mp4')
@@ -647,8 +529,13 @@ async function render(settings) {
   const ad = parseFloat(info.streams.find((s) => s.codec_type === 'audio').duration)
   const expected = plan.keptMs / 1000
   logStd(`verify: video=${vd}s audio=${ad}s expected=${expected.toFixed(3)}s size=${info.format.size}`)
-  if (Math.abs(vd - ad) > 0.1) throw new Error(`A/V duration mismatch: ${vd.toFixed(3)} vs ${ad.toFixed(3)}`)
-  if (Math.abs(vd - expected) > 0.15) throw new Error(`unexpected output duration: ${vd.toFixed(3)} vs ${expected.toFixed(3)}`)
+  // v2 tolerances: the select-filter drops up to ~1 boundary frame per cut —
+  // on many-cut renders (1000+) that legitimately accumulates past the old
+  // 0.1s/0.15s bounds and false-failed good renders. Real disasters (a
+  // truncated audio track) still trip these: 0.5s / audio<video.
+  if (Math.abs(vd - ad) > 0.5) throw new Error(`A/V duration mismatch: ${vd.toFixed(3)} vs ${ad.toFixed(3)}`)
+  if (Math.abs(vd - expected) > 0.5) throw new Error(`unexpected output duration: ${vd.toFixed(3)} vs ${expected.toFixed(3)}`)
+  if (ad < vd - 0.05) throw new Error(`audio shorter than video: ${ad.toFixed(3)} vs ${vd.toFixed(3)}`)
 
   // -- 5. cleanup temp (97%→100%) --
   progress({ phase: 'rendering', stage: AR.cleanup, pct: 97 })
@@ -669,11 +556,16 @@ try {
     logStd('analyze done')
   } else {
     const s = JSON.parse(settingsArg || '{}')
-    const settings = {
-      gapMs: [100, 200, 300].includes(s.gapMs) ? s.gapMs : 200,
-      thresholdDb: [-40, -35, -30].includes(s.thresholdDb) ? s.thresholdDb : -35,
-      crf: [28, 32, 36].includes(s.crf) ? s.crf : 32,
+    const clamp = (v, lo, hi, d) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d
     }
+    const settings = {
+      gapMs: clamp(s.gapMs, 0, 1000, 200),
+      thresholdDb: clamp(s.thresholdDb, -70, -5, -35),
+      crf: clamp(s.crf, 18, 40, 32),
+    }
+    if (Array.isArray(s.cuts) && s.cuts.length) settings.cuts = s.cuts
     await render(settings)
   }
   process.exit(0)

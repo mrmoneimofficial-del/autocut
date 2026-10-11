@@ -1,13 +1,15 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { signPathToken } from '@/lib/storage-auth'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
 const RUNNER = path.join(process.cwd(), 'scripts', 'pipeline-runner.mjs')
-const ACTIVE = new Set(['uploading', 'analyzing', 'rendering', 'mirroring'])
+const ACTIVE = new Set(['analyzing', 'rendering', 'mirroring'])
 
 type Ctx = { params: Promise<{ id: string }> }
 
@@ -23,13 +25,13 @@ function statusOf(id: string) {
   const prog = readJSON(path.join(ROOT, id, 'progress.json'))
   const st: Record<string, any> = { ...job, progress: prog && ACTIVE.has(String(prog.phase)) ? prog : null }
 
-  // live upload coverage — lets the client resume EXACTLY where it stopped
-  if (st.phase === 'uploading') {
-    const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(ROOT, id, 'chunks.json'))
-    if (cov && Array.isArray(cov.intervals)) {
-      st.uploaded = cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0)
-      st.uploadIntervals = cov.intervals
-    }
+  // permanent download link for the finished result (Bunny Storage + signed
+  // token) — minted fresh on every poll so a restored tab keeps working
+  if (st.phase === 'done' && st.storage?.path) {
+    st.resultUrl = `/api/uploads/stream?t=${signPathToken(String(st.storage.path))}&dl=1`
+  }
+  if (st.phase === 'done' && st.asset?.path) {
+    st.originalUrl = `/api/uploads/stream?t=${signPathToken(String(st.asset.path))}`
   }
 
   // stall recovery — server/container restarts (e.g. host reboot, Space wake) kill the
@@ -61,7 +63,11 @@ export async function GET(_req: Request, ctx: Ctx) {
   return Response.json(st)
 }
 
-/** POST /api/jobs/:id — { action: 'analyze' } | { action:'render', gapMs, thresholdDb, crf } */
+/** POST /api/jobs/:id — { action: 'analyze' } |
+ *  { action:'render', gapMs, thresholdDb, crf, cuts?: [start,end][] }
+ *  (jobs are staged as phase 'uploaded' by /api/uploads/chunked/complete.
+ *   `cuts` = the EXPLICIT montage plan computed (and hand-tuned) in the browser
+ *   from the audio envelope — the render then matches the preview exactly.) */
 export async function POST(req: Request, ctx: Ctx) {
   const { id } = await ctx.params
   if (!/^[a-f0-9]{32}$/.test(id)) return Response.json({ error: 'NOT_FOUND' }, { status: 404 })
@@ -74,14 +80,6 @@ export async function POST(req: Request, ctx: Ctx) {
   const action = body?.action
 
   if (action === 'analyze') {
-    // only from a fully-arrived file (coverage complete or phase already flipped)
-    if (job.phase === 'uploading') {
-      const cov = readJSON<{ size: number; intervals: [number, number][] }>(path.join(dir, 'chunks.json'))
-      const covered = cov && Array.isArray(cov.intervals)
-        ? cov.intervals.reduce((n: number, iv: any) => n + (Number(iv[1]) - Number(iv[0])), 0) : 0
-      if (covered < job.size) return Response.json({ error: 'الرفع لسه مش خلص' }, { status: 409 })
-      job.phase = 'uploaded'
-    }
     if (job.phase !== 'uploaded' && job.phase !== 'error') {
       return Response.json({ error: 'الحالة الحالية مش صالحة للتحليل' }, { status: 409 })
     }
@@ -93,19 +91,48 @@ export async function POST(req: Request, ctx: Ctx) {
   }
 
   if (action === 'render') {
-    if (job.phase !== 'ready' && job.phase !== 'error') {
+    // 'done' too → re-cut with tweaked settings without re-uploading
+    if (job.phase !== 'ready' && job.phase !== 'error' && job.phase !== 'done') {
       return Response.json({ error: 'الفيديو مش جاهز للقص بعد' }, { status: 409 })
     }
-    const settings = {
-      gapMs: [100, 200, 300].includes(Number(body?.gapMs)) ? Number(body.gapMs) : 200,
-      thresholdDb: [-40, -35, -30].includes(Number(body?.thresholdDb)) ? Number(body.thresholdDb) : -35,
-      crf: [28, 32, 36].includes(Number(body?.crf)) ? Number(body.crf) : 32,
+    const clamp = (v: unknown, lo: number, hi: number, d: number) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d
     }
+    const settings: Record<string, unknown> = {
+      gapMs: clamp(body?.gapMs, 0, 1000, 200),
+      thresholdDb: clamp(body?.thresholdDb, -70, -5, -35),
+      crf: clamp(body?.crf, 18, 40, 32),
+    }
+
+    // explicit montage cuts from the browser (validated + sanitized here,
+    // re-validated in the runner — both sides must agree on the plan)
+    if (Array.isArray(body?.cuts)) {
+      const durMs = Number(job?.meta?.durationMs || 0)
+      const maxEnd = durMs > 0 ? durMs + 2000 : Number.MAX_SAFE_INTEGER
+      const raw = (body.cuts as unknown[])
+        .filter((c): c is [number, number] => Array.isArray(c) && c.length >= 2
+          && Number.isFinite(Number(c[0])) && Number.isFinite(Number(c[1])))
+        .map((c) => [Math.max(0, Math.round(Number(c[0]))), Math.round(Number(c[1]))] as [number, number])
+        .filter(([s, e]) => e - s >= 20 && s < maxEnd)
+        .sort((a, b) => a[0] - b[0])
+      const merged: Array<[number, number]> = []
+      for (const [s, e] of raw) {
+        const last = merged[merged.length - 1]
+        if (last && s <= last[1] + 1) last[1] = Math.max(last[1], e)
+        else merged.push([s, e])
+      }
+      if (!merged.length) return Response.json({ error: 'مفيش فجوات مختارة — عدّل الإعدادات الأول' }, { status: 400 })
+      settings.cuts = merged.slice(0, 2000)
+    }
+
     job.phase = 'rendering'
     job.error = undefined
     job.renderSettings = settings
     fs.writeFileSync(jobFile, JSON.stringify(job))
-    spawnRunner(id, 'render', JSON.stringify(settings))
+    // results go to the upload session folder on Bunny Storage
+    const resultDir = job.asset?.path ? `uploads/${String(job.asset.path).split('/')[1]}` : `uploads/${id}`
+    spawnRunner(id, 'render', JSON.stringify(settings), resultDir)
     return Response.json({ ok: true })
   }
 
@@ -113,14 +140,14 @@ export async function POST(req: Request, ctx: Ctx) {
 }
 
 /** Spawn the pipeline runner detached — it survives request end & HMR reloads. */
-function spawnRunner(id: string, action: string, settings?: string) {
+function spawnRunner(id: string, action: string, settings?: string, resultDir?: string) {
   const dir = jobDirOf(id)
   const logFd = fs.openSync(path.join(dir, 'spawn.log'), 'a')
   const child = spawn(process.execPath, [RUNNER, id, action, ...(settings ? [settings] : [])], {
     cwd: path.join(process.cwd(), 'scripts'),
     detached: true,
     stdio: ['ignore', logFd, logFd],
-    env: { ...process.env },
+    env: { ...process.env, ...(resultDir ? { QATTAAS_RESULT_DIR: resultDir } : {}) },
   })
   child.unref()
   setTimeout(() => { try { fs.closeSync(logFd) } catch { /* already closed */ } }, 10_000)

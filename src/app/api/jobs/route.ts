@@ -1,67 +1,45 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
-import crypto from 'node:crypto'
+import { resolveBins } from '@/lib/cloud'
+import { bunnyConfigured } from '@/lib/bunny-storage'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
+export const maxDuration = 300
 
 const ROOT = path.join(process.cwd(), 'storage', 'jobs')
-const EXT_OK = new Set(['.mp4', '.mov', '.mkv', '.m4v', '.webm', '.avi', '.ts'])
 
-/** POST /api/jobs — { name, size } → { id } */
-export async function POST(req: Request) {
+/**
+ * GET /api/jobs — capability probe. The frontend calls this on load to pick
+ * its flow (uploads themselves ALWAYS go through the مستر منعم chunked
+ * system at /api/uploads/chunked/*):
+ *   mode 'server'     → storage writable → after the upload completes, the
+ *                       classic local pipeline runs (staged job + timeline UI)
+ *   mode 'cloud'      → storage read-only (Vercel…) but /tmp + ffmpeg OK →
+ *                       streamed cloud cut from Bunny Storage
+ *   mode 'cloud-lite' → no ffmpeg → upload + storage link only (no cut here)
+ */
+export async function GET() {
+  let storageOK = false
   try {
-    const body = await req.json().catch(() => null)
-    const name = typeof body?.name === 'string' ? body.name.slice(0, 200) : ''
-    const size = Number(body?.size)
-    if (!name || !Number.isFinite(size) || size < 1000 || size > 8 * 1024 ** 3) {
-      return Response.json({ error: 'بيانات غير صحيحة' }, { status: 400 })
-    }
-    const ext = EXT_OK.has(path.extname(name).toLowerCase()) ? path.extname(name).toLowerCase() : '.mp4'
+    fs.mkdirSync(ROOT, { recursive: true })
+    const probe = path.join(ROOT, `.probe-${Date.now().toString(36)}-${process.pid}`)
+    fs.writeFileSync(probe, 'ok')
+    fs.rmSync(probe, { force: true })
+    storageOK = true
+  } catch { /* read-only serverless FS */ }
 
-    // storage must be writable — serverless deploys (Vercel…) have a read-only FS.
-    // probe by CREATING a unique file: writing an existing one can pass even when
-    // new entries (job dirs) are blocked.
-    try {
-      fs.mkdirSync(ROOT, { recursive: true })
-      const probe = path.join(ROOT, `.probe-${Date.now().toString(36)}-${process.pid}`)
-      fs.writeFileSync(probe, 'ok')
-      fs.rmSync(probe, { force: true })
-    } catch {
-      return Response.json({
-        error: 'السيرفر ده للعرض بس — التخزين مش متاح هنا. محتاج نسخة شغّالة عشان الرفع والقص',
-      }, { status: 503 })
-    }
+  let tmpOK = false
+  try {
+    const probe = path.join(os.tmpdir(), `.qattaas-probe-${Date.now().toString(36)}`)
+    fs.writeFileSync(probe, 'ok')
+    fs.rmSync(probe, { force: true })
+    tmpOK = true
+  } catch { /* exotic read-only /tmp */ }
 
-    // sweep jobs older than 24h (renders never take that long)
-    const now = Date.now()
-    for (const id of fs.readdirSync(ROOT)) {
-      const dir = path.join(ROOT, id)
-      try {
-        if (!/^[a-f0-9]{32}$/.test(id)) continue
-        const st = fs.statSync(path.join(dir, 'job.json'))
-        if (now - st.mtimeMs > 24 * 3600_000) fs.rmSync(dir, { recursive: true, force: true })
-      } catch { /* ignore */ }
-    }
-
-    // disk headroom: source + parts + output
-    try {
-      const fsStats = fs.statfsSync(ROOT)
-      if (fsStats.bavail * fsStats.bsize < size * 1.6) {
-        return Response.json({ error: 'مساحة التخزين مش كافية للملف ده' }, { status: 507 })
-      }
-    } catch { /* statfs unavailable → skip check */ }
-
-    const id = crypto.randomBytes(16).toString('hex')
-    const dir = path.join(ROOT, id)
-    fs.mkdirSync(dir)
-    fs.writeFileSync(path.join(dir, 'original' + ext), '')
-    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
-      id, name, size, ext, phase: 'uploading', uploaded: 0, createdAt: now,
-    }))
-    return Response.json({ id })
-  } catch (e) {
-    console.error('[jobs] create error:', e)
-    return Response.json({ error: 'حصل خطأ — جرّب تاني' }, { status: 500 })
-  }
+  const cloud = { maxMB: Number(process.env.CLOUD_MAX_MB || 200), bunny: bunnyConfigured() }
+  if (storageOK) return Response.json({ ok: true, mode: 'server', cloud })
+  const bins = resolveBins()
+  return Response.json({ ok: true, mode: bins.ok ? 'cloud' : 'cloud-lite', cloud, tmpOK })
 }
