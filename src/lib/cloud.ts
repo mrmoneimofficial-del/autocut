@@ -17,6 +17,14 @@ import path from 'node:path'
 
 /* ----------------------------------------------------- binary resolution */
 
+/**
+ * GoFile mock endpoints (legacy cloud-prepare / deliver diagnostics).
+ * Overridable via env; default to the bundled mini-service port.
+ */
+export const GOFILE_UPLOAD = process.env.GOFILE_UPLOAD || 'http://localhost:3040'
+export const GOFILE_API = process.env.GOFILE_API || 'http://localhost:3040'
+
+
 let binsCache: { ffmpeg: string; ffprobe: string; ok: boolean } | null = null
 
 /**
